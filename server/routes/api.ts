@@ -3,63 +3,107 @@ import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 import { puppeteerCrawlerAgent } from "mulmocast";
 import { StartApiResponse } from "../types";
+import { GeminiSessionManager, createDefaultSessionConfig } from "../services/geminiSessionManager";
 dotenv.config();
 
 const router: Router = express.Router();
 
-// Session start endpoint
-router.get("/start", async (req: Request, res: Response): Promise<void> => {
-  const openaiKey = process.env.OPENAI_API_KEY;
+// Initialize Gemini Session Manager
+let geminiSessionManager: GeminiSessionManager | null = null;
+
+const initializeGeminiSessionManager = (): GeminiSessionManager => {
+  if (!geminiSessionManager) {
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      throw new Error("GEMINI_API_KEY environment variable not set");
+    }
+    geminiSessionManager = new GeminiSessionManager(geminiKey);
+  }
+  return geminiSessionManager;
+};
+
+// Session start endpoint - Updated for Gemini Live
+router.post("/start", async (req: Request, res: Response): Promise<void> => {
   const googleMapKey = process.env.GOOGLE_MAP_API_KEY;
 
-  if (!openaiKey) {
-    res
-      .status(500)
-      .json({ error: "OPENAI_API_KEY environment variable not set" });
-    return;
-  }
-
   try {
-    const sessionConfig = JSON.stringify({
-      session: {
-        type: "realtime",
-        model: "gpt-realtime",
-        audio: {
-          output: { voice: "shimmer" },
-        },
-      },
-    });
+    // Initialize Gemini Session Manager
+    const sessionManager = initializeGeminiSessionManager();
 
-    const response = await fetch(
-      "https://api.openai.com/v1/realtime/client_secrets",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${openaiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: sessionConfig,
-      },
-    );
+    // Create session configuration with customizable parameters
+    const systemInstructions =
+      req.body.systemInstructions ||
+      "You are a teacher who explains various things in a way that even middle school students can easily understand. " +
+      "When words alone are not enough, you MUST use the generateImage API to draw pictures and use them to help explain. " +
+      "When you are talking about places, objects, people, movies, books and other things, you MUST use the generateImage API " +
+      "to draw pictures to make the conversation more engaging.";
 
-    if (!response.ok) {
-      throw new Error(`OpenAI API error: ${response.statusText}`);
+    // Parse optional configuration parameters from request body
+    const temperature = req.body.temperature ? parseFloat(req.body.temperature.toString()) : undefined;
+    const maxOutputTokens = req.body.maxTokens ? parseInt(req.body.maxTokens.toString()) : undefined;
+    const audioInputSampleRate = req.body.inputSampleRate ? parseInt(req.body.inputSampleRate.toString()) : undefined;
+    const audioOutputSampleRate = req.body.outputSampleRate ? parseInt(req.body.outputSampleRate.toString()) : undefined;
+
+    // Build configuration options with proper type handling
+    const configOptions: {
+      temperature?: number;
+      maxOutputTokens?: number;
+      audioInputSampleRate?: number;
+      audioOutputSampleRate?: number;
+    } = {};
+
+    if (temperature && !isNaN(temperature)) {
+      configOptions.temperature = Math.max(0, Math.min(2, temperature));
+    }
+    if (maxOutputTokens && !isNaN(maxOutputTokens)) {
+      configOptions.maxOutputTokens = Math.max(1, Math.min(8192, maxOutputTokens));
+    }
+    if (audioInputSampleRate && !isNaN(audioInputSampleRate)) {
+      configOptions.audioInputSampleRate = audioInputSampleRate;
+    }
+    if (audioOutputSampleRate && !isNaN(audioOutputSampleRate)) {
+      configOptions.audioOutputSampleRate = audioOutputSampleRate;
     }
 
-    const data = await response.json();
+    const sessionConfig = createDefaultSessionConfig(systemInstructions, [], configOptions);
+
+    // Create Gemini Live session
+    const sessionResult = await sessionManager.createSession(sessionConfig);
+
+    if (!sessionResult.success) {
+      console.error("Failed to create Gemini Live session:", sessionResult.error);
+      res.status(500).json({
+        error: "Failed to create session",
+        details: sessionResult.error.message,
+      });
+      return;
+    }
+
+    const session = sessionResult.data;
+
+    // Prepare response data compatible with existing frontend
     const responseData: StartApiResponse = {
       success: true,
-      message: "Session started",
-      ephemeralKey: data.value,
-      googleMapKey: googleMapKey,
+      message: "Gemini Live session started",
+      ephemeralKey: session.ephemeralToken, // For backward compatibility
+      ephemeralToken: session.ephemeralToken, // New field
+      websocketUrl: session.websocketUrl, // New field for Gemini Live
+      googleMapKey: googleMapKey || undefined,
     };
+
+    console.log("✅ Gemini Live session created:", {
+      sessionId: session.sessionId,
+      expiresAt: session.expiresAt,
+    });
+
     res.json(responseData);
   } catch (error: unknown) {
-    console.error("Failed to generate ephemeral key:", error);
+    console.error("Failed to start Gemini Live session:", error);
     const errorMessage =
       error instanceof Error ? error.message : "Unknown error";
+
     res.status(500).json({
-      error: "Failed to generate ephemeral key",
+      error: "Failed to start session",
       details: errorMessage,
     });
   }
@@ -158,7 +202,18 @@ router.post("/browse", async (req: Request, res: Response): Promise<void> => {
   }
 
   try {
-    const result = await puppeteerCrawlerAgent.agent({ namedInputs: { url } });
+    const result = await puppeteerCrawlerAgent.agent({
+      params: {},
+      debugInfo: {
+        verbose: false,
+        nodeId: "",
+        state: "",
+        subGraphs: new Map(),
+        retry: 0
+      },
+      filterParams: {},
+      namedInputs: { url }
+    } as any);
     res.json({
       success: true,
       data: result,

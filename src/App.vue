@@ -274,7 +274,26 @@ import {
   pluginWaitingMessage,
 } from "./plugins/type";
 import type { StartApiResponse } from "../server/types";
+// @ts-ignore
 import GoogleMap from "./components/GoogleMap.vue";
+import {
+  createWebSocketClient,
+  createGeminiLiveSetupMessage,
+  createTextInputMessage,
+  type WebSocketClient,
+  type GeminiLiveMessage,
+  type SessionCredentials
+} from "./services/webSocketClient";
+import {
+  createAudioStreamManager,
+  checkAudioSupport,
+  type AudioStreamManager
+} from "./services/audioStreamManager";
+import {
+  ToolAdapter,
+  ToolUtils,
+  type GeminiToolCall
+} from "./services/toolAdapter";
 
 const SYSTEM_PROMPT_KEY = "system_prompt_v2";
 const DEFAULT_SYSTEM_PROMPT =
@@ -309,11 +328,11 @@ watch(selectedResult, (newResult) => {
 });
 const chatActive = ref(false);
 
-const webrtc = {
-  pc: null as RTCPeerConnection | null,
-  dc: null as RTCDataChannel | null,
-  localStream: null as MediaStream | null,
-  remoteStream: null as MediaStream | null,
+// Gemini Live connection objects
+const geminiLive = {
+  wsClient: null as WebSocketClient | null,
+  audioManager: null as AudioStreamManager | null,
+  credentials: null as SessionCredentials | null,
 };
 
 function scrollToBottomOfImageContainer(): void {
@@ -336,7 +355,7 @@ function scrollCurrentResultToTop(): void {
       if (scrollableElement) {
         if (scrollableElement.tagName === "IFRAME") {
           try {
-            scrollableElement.contentWindow?.scrollTo(0, 0);
+            (scrollableElement as HTMLIFrameElement).contentWindow?.scrollTo(0, 0);
           } catch (e) {
             // Cross-origin iframe, can't scroll
           }
@@ -399,111 +418,147 @@ async function processToolCall(msg: any): Promise<void> {
     isGeneratingImage.value = true;
     generatingMessage.value = pluginGeneratingMessage(msg.name);
     scrollToBottomOfImageContainer();
+    // Note: This is legacy WebRTC code that should be removed
+    // The functionality has been moved to processGeminiToolCall function
+    console.warn("⚠️ Legacy WebRTC function call handler - should be removed");
+  } catch (e) {
+    console.error("Legacy code error:", e);
+  }
+}
+
+async function messageHandler(message: GeminiLiveMessage): Promise<void> {
+  console.log("📥 Received Gemini Live message:", JSON.stringify(message, null, 2));
+
+  try {
+    // Handle Gemini Live API message structure
+    if (message.setupComplete) {
+      console.log("✅ Gemini Live setup completed");
+      return;
+    }
+
+    if (message.serverContent) {
+      const serverContent = message.serverContent;
+
+      // Handle model turn with text and audio content
+      if (serverContent.modelTurn?.parts) {
+        for (const part of serverContent.modelTurn.parts) {
+          if (part.text) {
+            console.log("📝 Received text:", part.text);
+            currentText.value += part.text;
+          }
+
+          if (part.inlineData?.mimeType?.startsWith('audio/') && part.inlineData?.data) {
+            console.log("🔊 Received audio data");
+            await playAudioFromBase64(part.inlineData.data);
+          }
+        }
+      }
+
+      // Handle completion
+      if (serverContent.turnComplete || serverContent.generationComplete) {
+        if (currentText.value.trim()) {
+          messages.value.push(currentText.value);
+        }
+        currentText.value = "";
+      }
+    }
+
+    if (message.toolCall) {
+      // Handle tool calls in Gemini Live format
+      const toolCall = message.toolCall;
+      console.log("🔧 Received tool call:", toolCall);
+
+      if (toolCall.functionCalls) {
+        for (const functionCall of toolCall.functionCalls) {
+          await processGeminiToolCall({
+            type: "tool.call",
+            call_id: functionCall.id || `call_${Date.now()}`,
+            name: functionCall.name,
+            args: functionCall.args || {},
+          } as GeminiLiveMessage);
+        }
+      }
+    }
+
+  } catch (error) {
+    console.error("❌ Error handling Gemini Live message:", error);
+  }
+}
+
+async function processGeminiToolCall(message: GeminiLiveMessage): Promise<void> {
+  // Validate tool call format using adapter
+  if (!ToolAdapter.isValidGeminiToolCall(message)) {
+    console.error("❌ Invalid Gemini tool call format:", message);
+    return;
+  }
+
+  const toolCallMessage = message as GeminiToolCall;
+  const { toolName, args, callId } = ToolAdapter.extractToolCallArgs(toolCallMessage);
+
+  try {
+    console.log("🔧 Processing Gemini tool call:", ToolAdapter.formatToolCallForLogging(toolCallMessage));
+
+    isGeneratingImage.value = true;
+    generatingMessage.value = pluginGeneratingMessage(toolName);
+    scrollToBottomOfImageContainer();
+
     const context: PluginContext = {
       images: [],
     };
     if (selectedResult.value?.imageData) {
       context.images = [selectedResult.value.imageData];
     }
-    const promise = pluginExecute(context, msg.name, args);
-    const waitingMessage = pluginWaitingMessage(msg.name);
-    if (waitingMessage) {
-      webrtc.dc?.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            instructions: waitingMessage,
-            // e.g., the model might say: "Your image is ready."
-          },
-        }),
-      );
-    }
 
-    const result = await promise;
+    // Execute the tool using existing plugin system
+    const result = await pluginExecute(context, toolName, args);
     isGeneratingImage.value = false;
     pluginResults.value.push(result);
     selectedResult.value = result;
     scrollToBottomOfImageContainer();
     scrollCurrentResultToTop();
 
-    const outputPayload: Record<string, unknown> = {
-      status: result.message,
-    };
-    if (result.jsonData) {
-      outputPayload.data = result.jsonData;
-    }
-    webrtc.dc?.send(
-      JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-          type: "function_call_output",
-          call_id: msg.call_id,
-          output: JSON.stringify(outputPayload),
-        },
-      }),
-    );
-    if (result.instructions) {
-      webrtc.dc?.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            instructions: result.instructions,
-          },
-        }),
-      );
-    }
-  } catch (e) {
-    console.error("Failed to parse function call arguments", e);
-    // Let the model know that we failed to parse the function call arguments.
-    webrtc.dc?.send(
-      JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-          type: "function_call_output",
-          call_id: msg.call_id,
-          output: `Failed to parse function call arguments: ${e}`,
-        },
-      }),
-    );
-    // We don't need to send "response.create" here.
-  }
-}
+    // Create tool response using adapter
+    const toolResponse = ToolAdapter.createToolResponse(callId, result);
 
-async function messageHandler(event: MessageEvent): Promise<void> {
-  const msg = JSON.parse(event.data);
-  // console.log("Message", event.data.length, msg.type);
-  if (msg.type === "error") {
-    console.error("Error", msg.error);
-  }
-  if (msg.type === "response.text.delta") {
-    currentText.value += msg.delta;
-  }
-  if (msg.type === "response.completed") {
-    if (currentText.value.trim()) {
-      messages.value.push(currentText.value);
+    if (geminiLive.wsClient) {
+      await geminiLive.wsClient.sendMessage(toolResponse);
+      console.log("📤 Tool response sent:", callId);
+
+      // Send additional instructions if available
+      if (result.instructions) {
+        const instructionMessage = createTextInputMessage(result.instructions);
+        await geminiLive.wsClient.sendMessage(instructionMessage);
+      }
     }
-    currentText.value = "";
-  }
-  if (msg.type === "response.function_call_arguments.delta") {
-    const id = msg.id || msg.call_id;
-    pendingToolArgs[id] = (pendingToolArgs[id] || "") + msg.delta;
-  }
-  if (msg.type === "response.function_call_arguments.done") {
-    await processToolCall(msg);
+
+    console.log("✅ Tool call completed:", toolName);
+  } catch (error) {
+    console.error("❌ Failed to process Gemini tool call:", error);
+    isGeneratingImage.value = false;
+
+    // Send error response using adapter
+    if (geminiLive.wsClient) {
+      const errorResponse = ToolUtils.createStandardErrorResponse(callId, error as Error);
+      await geminiLive.wsClient.sendMessage(errorResponse);
+    }
   }
 }
 
 async function startChat(): Promise<void> {
-  // Gard against double start
+  // Guard against double start
   if (chatActive.value || connecting.value) return;
 
   connecting.value = true;
 
-  // Call the start API endpoint to get ephemeral key
-  const config = {
-    apiKey: undefined as string | undefined,
-  };
   try {
+    // Check audio support first
+    const audioSupport = checkAudioSupport();
+    if (!audioSupport.hasWebAudio || !audioSupport.hasGetUserMedia) {
+      throw new Error("Audio not supported in this browser");
+    }
+
+    // Call the start API endpoint to get Gemini Live session credentials
+    console.log("🚀 Starting Gemini Live session...");
     const response = await fetch("/api/start", {
       method: "GET",
       headers: {
@@ -516,149 +571,201 @@ async function startChat(): Promise<void> {
     }
 
     startResponse.value = await response.json();
-    config.apiKey = startResponse.value.ephemeralKey;
-    googleMapKey.value = startResponse.value.googleMapKey;
-
-    if (!config.apiKey) {
-      throw new Error("No ephemeral key received from server");
+    if (!startResponse.value) {
+      throw new Error("No response from server");
     }
-  } catch (err) {
-    console.error("Failed to get ephemeral key:", err);
-    alert("Failed to start session. Check console for details.");
-    connecting.value = false;
-    return;
-  }
 
-  try {
-    webrtc.pc = new RTCPeerConnection();
+    googleMapKey.value = startResponse.value.googleMapKey || "";
 
-    // Data channel for model events
-    const dc = webrtc.pc.createDataChannel("oai-events");
-    webrtc.dc = dc;
-    dc.addEventListener("open", () => {
-      dc.send(
-        JSON.stringify({
-          type: "session.update",
-          session: {
-            type: "realtime",
-            model: "gpt-realtime",
-            instructions: systemPrompt.value,
-            audio: {
-              output: {
-                voice: "shimmer",
-              },
-            },
-            tools: pluginTools(startResponse.value),
-          },
-        }),
-      );
-    });
-    dc.addEventListener("message", messageHandler);
-    dc.addEventListener("close", () => {
-      webrtc.dc = null;
-    });
+    if (!startResponse.value.ephemeralToken || !startResponse.value.websocketUrl) {
+      throw new Error("Invalid session response from server");
+    }
 
-    // Play remote audio
-    webrtc.remoteStream = new MediaStream();
-    webrtc.pc.ontrack = (event) => {
-      webrtc.remoteStream.addTrack(event.track);
+    // Create session credentials
+    geminiLive.credentials = {
+      ephemeralToken: startResponse.value.ephemeralToken,
+      websocketUrl: startResponse.value.websocketUrl,
+      sessionId: `session-${Date.now()}`,
     };
+
+    // Initialize audio manager
+    console.log("🎤 Initializing audio...");
+    geminiLive.audioManager = createAudioStreamManager();
+
+    // Setup audio input
+    await geminiLive.audioManager.setupInput();
+
+    // Setup audio output
     if (audioEl.value) {
-      audioEl.value.srcObject = webrtc.remoteStream;
+      await geminiLive.audioManager.setupOutput();
     }
 
-    // Send microphone audio
-    webrtc.localStream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
+    // Start audio streaming
+    await geminiLive.audioManager.startStreaming();
+
+    // Initialize WebSocket client
+    console.log("🔌 Connecting to Gemini Live...");
+    geminiLive.wsClient = createWebSocketClient({
+      url: geminiLive.credentials.websocketUrl,
+      reconnectAttempts: 3,
+      reconnectDelay: 1000,
     });
-    webrtc.localStream
-      .getTracks()
-      .forEach((track) => webrtc.pc.addTrack(track, webrtc.localStream));
 
-    // Create and send offer SDP
-    const offer = await webrtc.pc.createOffer();
-    await webrtc.pc.setLocalDescription(offer);
-
-    const response = await fetch("https://api.openai.com/v1/realtime/calls", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.apiKey}`,
-        "Content-Type": "application/sdp",
-      },
-      body: offer.sdp,
+    // Setup WebSocket event handlers
+    geminiLive.wsClient.onMessage(messageHandler);
+    geminiLive.wsClient.onStatusChange((status) => {
+      console.log("📡 WebSocket status:", status);
+      if (status === 'error') {
+        console.error("❌ WebSocket connection error");
+      }
     });
-    const responseText = await response.text();
+    geminiLive.wsClient.onError((error) => {
+      console.error("❌ WebSocket error:", error);
+    });
 
-    await webrtc.pc.setRemoteDescription({ type: "answer", sdp: responseText });
+    // Connect to Gemini Live
+    await geminiLive.wsClient.connect(geminiLive.credentials);
+
+    // Convert OpenAI tools to Gemini Live format and send initial setup message
+    const openaiTools = pluginTools(startResponse.value);
+    const geminiTools = ToolAdapter.convertToolsToGemini(openaiTools);
+
+    const setupMessage = createGeminiLiveSetupMessage(
+      systemPrompt.value,
+      geminiTools
+    );
+
+    console.log("📤 Sending Gemini Live setup message:", JSON.stringify(setupMessage, null, 2));
+    await geminiLive.wsClient.sendMessage(setupMessage);
+
+    // Start audio streaming automatically
+    if (geminiLive.audioManager) {
+      await geminiLive.audioManager.startStreaming();
+      console.log("🎤 Audio streaming started");
+    }
+
+    // Setup audio data streaming
+    if (geminiLive.audioManager) {
+      geminiLive.audioManager.onAudioData(async (audioData) => {
+        if (geminiLive.wsClient && geminiLive.wsClient.isConnected.value) {
+          // Convert audio data to base64 for WebSocket transmission
+          const audioBase64 = arrayBufferToBase64(audioData.buffer);
+
+          const audioMessage = {
+            realtimeInput: {
+              audio: {
+                data: audioBase64
+              }
+            }
+          };
+
+          await geminiLive.wsClient.sendMessage(audioMessage);
+          console.log("🎵 Audio data sent to Gemini Live:", audioData.length);
+        }
+      });
+    }
+
     chatActive.value = true;
+    console.log("✅ Gemini Live session started successfully");
+
   } catch (err) {
-    console.error(err);
+    console.error("❌ Failed to start Gemini Live session:", err);
     stopChat();
-    alert("Failed to start voice chat. Check console for details.");
+    alert(`Failed to start voice chat: ${err instanceof Error ? err.message : 'Unknown error'}`);
   } finally {
     connecting.value = false;
   }
 }
 
-function sendTextMessage(): void {
+async function sendTextMessage(): Promise<void> {
   const text = userInput.value.trim();
   if (!text) return;
 
-  const dc = webrtc.dc;
-  if (!chatActive.value || !dc || dc.readyState !== "open") {
-    console.warn(
-      "Cannot send text message because the data channel is not ready.",
-    );
+  if (!chatActive.value || !geminiLive.wsClient || !geminiLive.wsClient.isConnected.value) {
+    console.warn("Cannot send text message because WebSocket is not connected");
     return;
   }
 
-  dc.send(
-    JSON.stringify({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text,
-          },
-        ],
-      },
-    }),
-  );
-  dc.send(
-    JSON.stringify({
-      type: "response.create",
-      response: {},
-    }),
-  );
+  try {
+    // Send text message to Gemini Live
+    const textMessage = createTextInputMessage(text);
+    await geminiLive.wsClient.sendMessage(textMessage);
 
-  messages.value.push(`You: ${text}`);
-  userInput.value = "";
+    // Add to local message history
+    messages.value.push(`You: ${text}`);
+    userInput.value = "";
+
+    console.log("📤 Text message sent:", text);
+  } catch (error) {
+    console.error("❌ Failed to send text message:", error);
+  }
 }
 
-function stopChat(): void {
-  if (webrtc.pc) {
-    webrtc.pc.close();
-    webrtc.pc = null;
+// Utility function for audio data conversion
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
   }
-  if (webrtc.dc) {
-    webrtc.dc.close();
-    webrtc.dc = null;
+  return btoa(binary);
+}
+
+// Function to play audio from base64 data
+async function playAudioFromBase64(base64Data: string): Promise<void> {
+  try {
+    // Convert base64 to blob
+    const binaryString = atob(base64Data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+
+    const audioBlob = new Blob([bytes], { type: 'audio/pcm' });
+    const audioUrl = URL.createObjectURL(audioBlob);
+
+    // Create and play audio element
+    const audio = new Audio(audioUrl);
+    audio.addEventListener('ended', () => {
+      URL.revokeObjectURL(audioUrl);
+    });
+
+    await audio.play();
+    console.log("🔊 Audio playback started");
+  } catch (error) {
+    console.error("❌ Failed to play audio:", error);
   }
-  if (webrtc.localStream) {
-    webrtc.localStream.getTracks().forEach((track) => track.stop());
-    webrtc.localStream = null;
+}
+
+async function stopChat(): Promise<void> {
+  try {
+    // Disconnect WebSocket
+    if (geminiLive.wsClient) {
+      await geminiLive.wsClient.disconnect();
+      geminiLive.wsClient = null;
+    }
+
+    // Stop audio streaming
+    if (geminiLive.audioManager) {
+      await geminiLive.audioManager.stopStreaming();
+      geminiLive.audioManager = null;
+    }
+
+    // Clear audio element
+    if (audioEl.value) {
+      audioEl.value.srcObject = null;
+    }
+
+    // Clear session credentials
+    geminiLive.credentials = null;
+
+    chatActive.value = false;
+    console.log("🔌 Gemini Live session stopped");
+  } catch (error) {
+    console.error("❌ Error stopping chat:", error);
+    chatActive.value = false;
   }
-  if (webrtc.remoteStream) {
-    webrtc.remoteStream.getTracks().forEach((track) => track.stop());
-    webrtc.remoteStream = null;
-  }
-  if (audioEl.value) {
-    audioEl.value.srcObject = null;
-  }
-  chatActive.value = false;
 }
 </script>
 

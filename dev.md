@@ -15,13 +15,13 @@ OpenAI Realtime APIからGoogle Gemini Live APIへの音声チャットアプリ
 
 #### Gemini Live統合
 - **`GeminiSessionManager`**: 完全なセッション管理実装
-- **型定義**: `server/types.ts`に包括的なGemini Live型定義
-- **認証**: API Key直接使用（ephemeral token代替）
-- **WebSocket URL**: 正しいGemini Live エンドポイント実装
+- **型定義**: `server/types.ts`に最新のGemini Live型定義を反映
+- **認証**: `authTokens.create`（`apiVersion=v1alpha`）でephemeral tokenを取得
+- **WebSocket URL**: Constrained用エンドポイント＋`access_token`クエリで接続
 
 ```typescript
 // 正しいWebSocket URL
-"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained"
 ```
 
 ### 2. フロントエンド実装 (95%)
@@ -32,19 +32,25 @@ OpenAI Realtime APIからGoogle Gemini Live APIへの音声チャットアプリ
 - **接続管理**: 自動再接続とエラーハンドリング
 
 #### メッセージフォーマット修正
-```typescript
-// セットアップメッセージ（修正後）
+```jsonc
+// セットアップメッセージ（最新仕様）
 {
-  model: 'models/gemini-2.5-flash-preview-native-audio-dialog',
-  generationConfig: {
-    temperature: 0.7,
-    maxOutputTokens: 8192,
-    responseModalities: ['TEXT', 'AUDIO']
-  },
-  systemInstruction: systemInstructions,
-  realtimeInputConfig: {
-    activityHandling: 'ACTIVITY_HANDLING_AUTOMATIC',
-    turnCoverage: 'TURN_COVERAGE_COMPLETE'
+  "setup": {
+    "model": "models/gemini-2.5-flash-preview-native-audio-dialog",
+    "generationConfig": {
+      "temperature": 0.7,
+      "maxOutputTokens": 8192
+    },
+    "responseModalities": ["TEXT", "AUDIO"],
+    "systemInstruction": {
+      "role": "system",
+      "parts": [{ "text": systemInstructions }]
+    },
+    "realtimeInputConfig": {
+      "activityHandling": "ACTIVITY_HANDLING_AUTOMATIC",
+      "turnCoverage": "TURN_COVERAGE_COMPLETE"
+    },
+    "tools": [...] // functionDeclarations形式
   }
 }
 ```
@@ -68,12 +74,11 @@ OpenAI Realtime APIからGoogle Gemini Live APIへの音声チャットアプリ
 
 ## テスト状況
 
-### Puppeteer MCPテスト結果 ✅
-- **APIサーバー**: 正常動作確認（Status 200）
-- **セッション作成**: 成功（ephemeralToken、websocketUrl取得）
-- **WebSocket接続**: 基本接続処理動作
-- **UI操作**: メッセージ送信機能確認
-- **フロントエンド**: http://localhost:5174/ 正常表示
+### 検証状況
+- **APIサーバー**: `npm run build:server` 成功（型チェック通過）
+- **セッション作成**: ephemeral token取得 + constrained WebSocket URL払い出し確認
+- **WebSocket接続**: セットアップメッセージ送信後にGemini応答待ち（ブラウザ実機検証は要継続）
+- **UI**: 手動動作確認を継続予定（自動テスト未整備）
 
 ### 開発環境設定
 ```bash
@@ -119,24 +124,25 @@ vite           # フロントエンドのみ
 - **Text Input**: `role: 'USER'`追加
 - **Response**: `serverContent`形式対応
 
-### 2025-09-24: WebSocket認証修正
-- **Parameter**: `token` → `access_token`
-- **URL**: 正しいGemini Live WebSocket endpoint
-- **Token**: API key直接使用（development用）
+### 2025-09-27: Gemini Live認証＆セットアップ再構築
+- **Ephemeral Token**: `authTokens.create`で取得（有効期限・接続猶予を保持）
+- **WebSocket**: Constrainedエンドポイント + `access_token=<ephemeral token>` に変更
+- **Setup Payload**: `{ setup: {...} }` 形式／`systemInstruction.parts[]`／`functionDeclarations`
+- **ツール互換性**: `GeminiTool`をcamelCaseに更新し、フロント変換を修正
 
 ## 残りの課題
 
-### 1. Gemini Live APIレスポンス検証 (5%)
-- **課題**: 実際のAI応答受信テスト未完了
-- **対策**: リアルタイム通信のデバッグログ強化
+### 1. Gemini Live APIレスポンス検証 (進行中)
+- **課題**: 実際のAI応答ストリーム検証が手動のまま
+- **対策**: ブラウザログの収集と部分的な自動テスト導入
 
-### 2. エラーハンドリング強化 (10%)
-- **課題**: WebSocket切断時の詳細エラー情報
-- **対策**: 接続再試行ロジックの実装
+### 2. エラーログ／再接続改善 (進行中)
+- **課題**: WebSocket切断時の詳細ログ不足
+- **対策**: クライアント側リトライ戦略とサーバーログ増強
 
-### 3. 音声品質最適化 (10%)
+### 3. 音声品質最適化 (未着手)
 - **課題**: AudioWorklet移行（ScriptProcessorNode廃止予定）
-- **対策**: モダンWeb Audio API実装
+- **対策**: Worklet実装とパフォーマンステスト
 
 ## 本番デプロイ準備
 
@@ -148,7 +154,7 @@ NODE_ENV=production
 ```
 
 ### セキュリティ考慮事項
-- [ ] Ephemeral token生成実装（現在はAPI key直接使用）
+- [x] Ephemeral token生成実装（`authTokens.create`）
 - [ ] CORS設定の本番環境最適化
 - [ ] API rate limiting実装
 - [ ] WebSocket接続数制限
@@ -176,28 +182,24 @@ NODE_ENV=production
 3. **音声品質の最終調整**
 4. **本番環境デプロイテスト**
 
-## 最新アップデート (2025年9月26日)
+## 最新アップデート (2025年9月27日)
 
 ### 完了した修正
-- ✅ Import文typo修正 (ESSIONS → SESSIONS) - 既に解決済み
-- ✅ 空ファイル削除 (`server/types.js`) - クリーンアップ完了
-- ✅ App.vueのimport整理 - WebSocket/AudioStreamManager移行完了
+- ✅ `GeminiSessionManager`でのephemeral token生成＋期限管理
+- ✅ WebSocket setupメッセージを最新スキーマに適合
+- ✅ `GeminiTool`/ToolAdapterのcamelCase対応
 
 ### 現在の状況
-- **移行作業**: 100% 完了 ✅
-- **コミット507a724**: "Complete migration from OpenAI Realtime to Gemini Live API"
-- **技術債務**: 最小限まで削減
-- **コード品質**: Production Ready
+- **移行作業**: 機能面は完了、応答検証フェーズ継続
+- **既知課題**: `npm run build` でVite/rollup型解決と一部Vue型エラーあり
+- **次ステップ**: ブラウザでのLive応答確認と型エラー解消
 
-### 技術スタック最終版
-- **AI API**: Gemini Live API (完全移行)
-- **通信**: WebSocket (Gemini Live WebSocket URL)
-- **音声**: WebAudioAPI + Base64エンコーディング
-- **認証**: Gemini ephemeralToken
-- **フロントエンド**: Vue 3 + TypeScript + WebSocket
-- **バックエンド**: Node.js + Express + GeminiSessionManager
+### 技術スタック更新
+- **AI API**: Gemini Live API（v1alpha constrained接続）
+- **認証**: Ephemeral token (`authTokens.create`)
+- **通信**: WebSocket + setup/realtimeInputメッセージ
 
-**Status**: ✅ Migration 100% Complete - Production Ready
+**Status**: 🚧 QA中（本番投入前に追加検証が必要）
 **Next Phase**: Performance Optimization & Monitoring
 
 ## 最新アップデート (2025年9月27日)

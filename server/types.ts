@@ -77,7 +77,7 @@ export interface GenerationConfig {
 
 // Tool Definition Types
 export interface GeminiTool {
-  function_declarations: Array<{
+  functionDeclarations: Array<{
     name: string;
     description: string;
     parameters: JSONSchema;

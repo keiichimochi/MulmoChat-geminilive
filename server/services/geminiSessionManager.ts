@@ -1,4 +1,10 @@
-import { GoogleGenAI } from "@google/genai";
+import {
+  ActivityHandling,
+  GoogleGenAI,
+  Modality,
+  TurnCoverage,
+  type LiveConnectConfig,
+} from "@google/genai";
 import {
   GeminiSessionConfig,
   GeminiSessionResponse,
@@ -20,6 +26,7 @@ import {
 export class GeminiSessionManager {
   private client: GoogleGenAI;
   private apiKey: string;
+  private readonly websocketApiVersion = "v1alpha";
   private sessions: Map<string, SessionInfo> = new Map();
 
   constructor(apiKey: string) {
@@ -46,19 +53,15 @@ export class GeminiSessionManager {
       // Generate session ID
       const sessionId = this.generateSessionId();
 
-      // Note: This is a placeholder implementation
-      // The actual Gemini Live API for ephemeral tokens might have different endpoints
-      // This will need to be updated based on the official Live API documentation
-
-      // For now, we'll simulate the session creation
-      // In practice, this should call the Gemini Live API to get ephemeral tokens
-      const ephemeralToken = await this.generateEphemeralToken(sessionId, config);
+      // Create an ephemeral auth token for the session using the official Gemini Live API
+      const tokenInfo = await this.generateEphemeralToken(sessionId, config);
       const websocketUrl = this.getWebSocketUrl();
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour expiry
+
+      const expiresAt = tokenInfo.expiresAt;
 
       const sessionResponse: GeminiSessionResponse = {
         sessionId,
-        ephemeralToken,
+        ephemeralToken: tokenInfo.token,
         websocketUrl,
         expiresAt,
       };
@@ -69,6 +72,7 @@ export class GeminiSessionManager {
         config,
         createdAt: new Date(),
         expiresAt,
+        sessionStartExpiresAt: tokenInfo.sessionStartExpiresAt,
         status: "active",
       });
 
@@ -116,12 +120,13 @@ export class GeminiSessionManager {
 
       // Generate new ephemeral token
       const newToken = await this.generateEphemeralToken(sessionId, session.config);
-      const newExpiresAt = new Date(Date.now() + 60 * 60 * 1000);
+      const newExpiresAt = newToken.expiresAt;
 
       // Update session info
       session.expiresAt = newExpiresAt;
+      session.sessionStartExpiresAt = newToken.sessionStartExpiresAt;
 
-      return { success: true, data: newToken };
+      return { success: true, data: newToken.token };
     } catch (error) {
       console.error("Failed to refresh token:", error);
       return {
@@ -270,19 +275,88 @@ export class GeminiSessionManager {
     return `gemini-session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   }
 
-  private async generateEphemeralToken(sessionId: string, config: GeminiSessionConfig): Promise<string> {
-    // For now, we'll use the API key directly for WebSocket authentication
-    // In production, this should call the Gemini API to generate ephemeral tokens:
-    // POST https://generativelanguage.googleapis.com/v1beta/ephemeralTokens:create
+  private async generateEphemeralToken(
+    sessionId: string,
+    config: GeminiSessionConfig
+  ): Promise<EphemeralTokenInfo> {
+    const now = Date.now();
+    const expireTime = new Date(now + 5 * 60 * 1000); // 5 minutes
+    const sessionStartExpiry = new Date(now + 60 * 1000); // must connect within 60 seconds
 
-    // Since we're in development and ephemeral token creation might not be available yet,
-    // we'll use the API key directly for WebSocket connections
-    return this.apiKey;
+    const normalizedModel = this.normalizeModelName(config.model);
+    const liveConfig = this.buildLiveConnectConfig(config);
+
+    try {
+      const response = await this.client.authTokens.create({
+        config: {
+          httpOptions: { apiVersion: this.websocketApiVersion },
+          uses: 1,
+          expireTime: expireTime.toISOString(),
+          newSessionExpireTime: sessionStartExpiry.toISOString(),
+          liveConnectConstraints: {
+            model: normalizedModel,
+            config: liveConfig,
+          },
+        },
+      });
+
+      if (!response.name) {
+        throw new Error("Gemini Live did not return an auth token name");
+      }
+
+      return {
+        token: response.name,
+        expiresAt: expireTime,
+        sessionStartExpiresAt: sessionStartExpiry,
+      };
+    } catch (error) {
+      console.error("Failed to create ephemeral token:", error);
+      throw error;
+    }
   }
 
   private getWebSocketUrl(): string {
-    // Official Gemini Live API WebSocket endpoint
-    return "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+    return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.${this.websocketApiVersion}.GenerativeService.BidiGenerateContentConstrained`;
+  }
+
+  private normalizeModelName(model: string): string {
+    return model.startsWith("models/") ? model : `models/${model}`;
+  }
+
+  private buildLiveConnectConfig(config: GeminiSessionConfig): LiveConnectConfig {
+    const generationConfig = config.generationConfig
+      ? {
+          ...(config.generationConfig.temperature !== undefined
+            ? { temperature: config.generationConfig.temperature }
+            : {}),
+          ...(config.generationConfig.maxOutputTokens !== undefined
+            ? { maxOutputTokens: config.generationConfig.maxOutputTokens }
+            : {}),
+        }
+      : undefined;
+
+    const normalizedGenerationConfig =
+      generationConfig && Object.keys(generationConfig).length > 0
+        ? generationConfig
+        : undefined;
+
+    const liveConfig: LiveConnectConfig = {
+      responseModalities: [Modality.TEXT, Modality.AUDIO],
+      systemInstruction: {
+        role: 'system',
+        parts: [{ text: config.systemInstructions }],
+      },
+      realtimeInputConfig: {
+        activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+        turnCoverage: TurnCoverage.TURN_INCLUDES_ALL_INPUT,
+      },
+    };
+
+    if (normalizedGenerationConfig) {
+      liveConfig.generationConfig = normalizedGenerationConfig;
+    }
+
+    return liveConfig;
   }
 
   /**
@@ -334,7 +408,14 @@ interface SessionInfo {
   config: GeminiSessionConfig;
   createdAt: Date;
   expiresAt: Date;
+  sessionStartExpiresAt: Date;
   status: "active" | "expired" | "closed";
+}
+
+interface EphemeralTokenInfo {
+  token: string;
+  expiresAt: Date;
+  sessionStartExpiresAt: Date;
 }
 
 /**

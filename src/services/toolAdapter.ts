@@ -54,7 +54,7 @@ export class ToolAdapter {
    */
   static convertToGeminiTool(openaiTool: OpenAIToolDefinition): GeminiTool {
     return {
-      function_declarations: [{
+      functionDeclarations: [{
         name: openaiTool.name,
         description: openaiTool.description,
         parameters: {

@@ -1,3 +1,4 @@
+英語で think して、日本語で output してください
 # Repository Guidelines
 
 ## Project Structure & Module Organization

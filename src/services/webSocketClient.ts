@@ -12,7 +12,7 @@ export interface SessionCredentials {
 }
 
 export interface GeminiLiveMessage {
-  type: string;
+  type?: string;
   timestamp?: number;
   payload?: Record<string, unknown>;
   [key: string]: unknown;
@@ -134,8 +134,12 @@ export class WebSocketClient {
       const messageStr = JSON.stringify(message);
       this.ws.send(messageStr);
 
+      const inferredType =
+        message.type ??
+        (message.setup ? 'setup' : message.realtimeInput ? 'realtimeInput' : 'unknown');
+
       console.log('📤 Sent message to Gemini Live:', {
-        type: message.type,
+        type: inferredType,
         size: messageStr.length,
       });
     } catch (error) {
@@ -347,20 +351,28 @@ export function createGeminiLiveSetupMessage(
   systemInstructions: string,
   tools: unknown[] = []
 ): GeminiLiveMessage {
-  return {
+  const setupPayload: Record<string, unknown> = {
     model: 'models/gemini-2.5-flash-preview-native-audio-dialog',
     generationConfig: {
       temperature: 0.7,
       maxOutputTokens: 8192,
-      responseModalities: ['TEXT', 'AUDIO'],
     },
-    systemInstruction: systemInstructions,
-    tools: tools.length > 0 ? tools : undefined,
+    responseModalities: ['TEXT', 'AUDIO'],
+    systemInstruction: {
+      role: 'system',
+      parts: [{ text: systemInstructions }],
+    },
     realtimeInputConfig: {
       activityHandling: 'ACTIVITY_HANDLING_AUTOMATIC',
       turnCoverage: 'TURN_COVERAGE_COMPLETE',
     },
   };
+
+  if (tools.length > 0) {
+    setupPayload.tools = tools;
+  }
+
+  return { setup: setupPayload };
 }
 
 /**

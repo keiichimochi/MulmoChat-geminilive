@@ -1,6 +1,10 @@
 import { ref, watch, nextTick } from "vue";
-import { pluginTools, pluginExecute, pluginGeneratingMessage, pluginWaitingMessage, } from "./plugins/type";
+import { pluginTools, pluginExecute, pluginGeneratingMessage, } from "./plugins/type";
+// @ts-ignore
 import GoogleMap from "./components/GoogleMap.vue";
+import { createWebSocketClient, createGeminiLiveSetupMessage, createTextInputMessage } from "./services/webSocketClient";
+import { createAudioStreamManager, checkAudioSupport } from "./services/audioStreamManager";
+import { ToolAdapter, ToolUtils } from "./services/toolAdapter";
 const SYSTEM_PROMPT_KEY = "system_prompt_v2";
 const DEFAULT_SYSTEM_PROMPT = "You are a teacher who explains various things in a way that even middle school students can easily understand. When words alone are not enough, you MUST use the generateImage API to draw pictures and use them to help explain. When you are talking about places, objects, people, movies, books and other things, you MUST use the generateImage API to draw pictures to make the conversation more engaging.";
 const audioEl = ref(null);
@@ -19,6 +23,9 @@ const userInput = ref("");
 const twitterEmbedData = ref({});
 const googleMapKey = ref(null);
 const startResponse = ref(null);
+const micLevel = ref(0);
+const micWaveform = ref([]);
+const MAX_WAVEFORM_POINTS = 48;
 watch(systemPrompt, (val) => {
     localStorage.setItem(SYSTEM_PROMPT_KEY, val);
 });
@@ -28,12 +35,86 @@ watch(selectedResult, (newResult) => {
     }
 });
 const chatActive = ref(false);
-const webrtc = {
-    pc: null,
-    dc: null,
-    localStream: null,
-    remoteStream: null,
+// Gemini Live connection objects
+const geminiLive = {
+    wsClient: null,
+    audioManager: null,
+    credentials: null,
 };
+function isRecord(value) {
+    return typeof value === "object" && value !== null;
+}
+function isInlineAudioData(value) {
+    if (!isRecord(value)) {
+        return false;
+    }
+    if (value.mimeType !== undefined && typeof value.mimeType !== "string") {
+        return false;
+    }
+    if (value.data !== undefined && typeof value.data !== "string") {
+        return false;
+    }
+    return true;
+}
+function isGeminiServerContentPart(value) {
+    if (!isRecord(value)) {
+        return false;
+    }
+    if (value.text !== undefined && typeof value.text !== "string") {
+        return false;
+    }
+    if (value.inlineData !== undefined && !isInlineAudioData(value.inlineData)) {
+        return false;
+    }
+    return true;
+}
+function isGeminiServerContent(value) {
+    if (!isRecord(value)) {
+        return false;
+    }
+    const maybe = value;
+    if (maybe.modelTurn !== undefined) {
+        if (!isRecord(maybe.modelTurn)) {
+            return false;
+        }
+        const parts = maybe.modelTurn.parts;
+        if (parts !== undefined && (!Array.isArray(parts) || !parts.every(isGeminiServerContentPart))) {
+            return false;
+        }
+    }
+    if (maybe.turnComplete !== undefined && typeof maybe.turnComplete !== "boolean") {
+        return false;
+    }
+    if (maybe.generationComplete !== undefined && typeof maybe.generationComplete !== "boolean") {
+        return false;
+    }
+    return true;
+}
+function isGeminiFunctionCall(value) {
+    if (!isRecord(value)) {
+        return false;
+    }
+    if (typeof value.name !== "string") {
+        return false;
+    }
+    if (value.args !== undefined && !isRecord(value.args)) {
+        return false;
+    }
+    if (value.id !== undefined && typeof value.id !== "string") {
+        return false;
+    }
+    return true;
+}
+function isGeminiToolCallPayload(value) {
+    if (!isRecord(value)) {
+        return false;
+    }
+    const functionCalls = value.functionCalls;
+    if (functionCalls === undefined) {
+        return true;
+    }
+    return Array.isArray(functionCalls) && functionCalls.every(isGeminiFunctionCall);
+}
 function scrollToBottomOfImageContainer() {
     nextTick(() => {
         if (imageContainer.value) {
@@ -105,235 +186,331 @@ async function processToolCall(msg) {
         isGeneratingImage.value = true;
         generatingMessage.value = pluginGeneratingMessage(msg.name);
         scrollToBottomOfImageContainer();
+        // Note: This is legacy WebRTC code that should be removed
+        // The functionality has been moved to processGeminiToolCall function
+        console.warn("⚠️ Legacy WebRTC function call handler - should be removed");
+    }
+    catch (e) {
+        console.error("Legacy code error:", e);
+    }
+}
+async function messageHandler(message) {
+    console.log("📥 Received Gemini Live message:", JSON.stringify(message, null, 2));
+    try {
+        // Handle Gemini Live API message structure
+        if (message.setupComplete) {
+            console.log("✅ Gemini Live setup completed");
+            return;
+        }
+        if (isGeminiServerContent(message.serverContent)) {
+            const serverContent = message.serverContent;
+            // Handle model turn with text and audio content
+            if (serverContent.modelTurn?.parts) {
+                for (const part of serverContent.modelTurn.parts) {
+                    if (part.text) {
+                        console.log("📝 Received text:", part.text);
+                        currentText.value += part.text;
+                    }
+                    if (part.inlineData?.mimeType?.startsWith('audio/') && part.inlineData?.data) {
+                        console.log("🔊 Received audio data");
+                        await playAudioFromBase64(part.inlineData.data);
+                    }
+                }
+            }
+            // Handle completion
+            if (serverContent.turnComplete || serverContent.generationComplete) {
+                if (currentText.value.trim()) {
+                    messages.value.push(currentText.value);
+                }
+                currentText.value = "";
+            }
+        }
+        if (isGeminiToolCallPayload(message.toolCall)) {
+            // Handle tool calls in Gemini Live format
+            const toolCall = message.toolCall;
+            console.log("🔧 Received tool call:", toolCall);
+            if (toolCall.functionCalls) {
+                for (const functionCall of toolCall.functionCalls) {
+                    if (typeof functionCall.name !== "string") {
+                        console.warn("Skipping invalid tool call without name", functionCall);
+                        continue;
+                    }
+                    const callMessage = {
+                        type: "tool.call",
+                        call_id: functionCall.id && functionCall.id.length > 0
+                            ? functionCall.id
+                            : `call_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+                        name: functionCall.name,
+                        args: functionCall.args ?? {},
+                    };
+                    await processGeminiToolCall(callMessage);
+                }
+            }
+        }
+    }
+    catch (error) {
+        console.error("❌ Error handling Gemini Live message:", error);
+    }
+}
+async function processGeminiToolCall(message) {
+    // Validate tool call format using adapter (extra safety)
+    if (!ToolAdapter.isValidGeminiToolCall(message)) {
+        console.error("❌ Invalid Gemini tool call format:", message);
+        return;
+    }
+    const toolCallMessage = message;
+    const { toolName, args, callId } = ToolAdapter.extractToolCallArgs(toolCallMessage);
+    try {
+        console.log("🔧 Processing Gemini tool call:", ToolAdapter.formatToolCallForLogging(toolCallMessage));
+        isGeneratingImage.value = true;
+        generatingMessage.value = pluginGeneratingMessage(toolName);
+        scrollToBottomOfImageContainer();
         const context = {
             images: [],
         };
         if (selectedResult.value?.imageData) {
             context.images = [selectedResult.value.imageData];
         }
-        const promise = pluginExecute(context, msg.name, args);
-        const waitingMessage = pluginWaitingMessage(msg.name);
-        if (waitingMessage) {
-            webrtc.dc?.send(JSON.stringify({
-                type: "response.create",
-                response: {
-                    instructions: waitingMessage,
-                    // e.g., the model might say: "Your image is ready."
-                },
-            }));
-        }
-        const result = await promise;
+        // Execute the tool using existing plugin system
+        const result = await pluginExecute(context, toolName, args);
         isGeneratingImage.value = false;
         pluginResults.value.push(result);
         selectedResult.value = result;
         scrollToBottomOfImageContainer();
         scrollCurrentResultToTop();
-        const outputPayload = {
-            status: result.message,
-        };
-        if (result.jsonData) {
-            outputPayload.data = result.jsonData;
+        // Create tool response using adapter
+        const toolResponse = ToolAdapter.createToolResponse(callId, result);
+        if (geminiLive.wsClient) {
+            await geminiLive.wsClient.sendMessage(toolResponse);
+            console.log("📤 Tool response sent:", callId);
+            // Send additional instructions if available
+            if (result.instructions) {
+                const instructionMessage = createTextInputMessage(result.instructions);
+                await geminiLive.wsClient.sendMessage(instructionMessage);
+            }
         }
-        webrtc.dc?.send(JSON.stringify({
-            type: "conversation.item.create",
-            item: {
-                type: "function_call_output",
-                call_id: msg.call_id,
-                output: JSON.stringify(outputPayload),
-            },
-        }));
-        if (result.instructions) {
-            webrtc.dc?.send(JSON.stringify({
-                type: "response.create",
-                response: {
-                    instructions: result.instructions,
-                },
-            }));
+        console.log("✅ Tool call completed:", toolName);
+    }
+    catch (error) {
+        console.error("❌ Failed to process Gemini tool call:", error);
+        isGeneratingImage.value = false;
+        // Send error response using adapter
+        if (geminiLive.wsClient) {
+            const errorResponse = ToolUtils.createStandardErrorResponse(callId, error);
+            await geminiLive.wsClient.sendMessage(errorResponse);
         }
-    }
-    catch (e) {
-        console.error("Failed to parse function call arguments", e);
-        // Let the model know that we failed to parse the function call arguments.
-        webrtc.dc?.send(JSON.stringify({
-            type: "conversation.item.create",
-            item: {
-                type: "function_call_output",
-                call_id: msg.call_id,
-                output: `Failed to parse function call arguments: ${e}`,
-            },
-        }));
-        // We don't need to send "response.create" here.
-    }
-}
-async function messageHandler(event) {
-    const msg = JSON.parse(event.data);
-    // console.log("Message", event.data.length, msg.type);
-    if (msg.type === "error") {
-        console.error("Error", msg.error);
-    }
-    if (msg.type === "response.text.delta") {
-        currentText.value += msg.delta;
-    }
-    if (msg.type === "response.completed") {
-        if (currentText.value.trim()) {
-            messages.value.push(currentText.value);
-        }
-        currentText.value = "";
-    }
-    if (msg.type === "response.function_call_arguments.delta") {
-        const id = msg.id || msg.call_id;
-        pendingToolArgs[id] = (pendingToolArgs[id] || "") + msg.delta;
-    }
-    if (msg.type === "response.function_call_arguments.done") {
-        await processToolCall(msg);
     }
 }
 async function startChat() {
-    // Gard against double start
+    // Guard against double start
     if (chatActive.value || connecting.value)
         return;
     connecting.value = true;
-    // Call the start API endpoint to get ephemeral key
-    const config = {
-        apiKey: undefined,
-    };
     try {
+        // Check audio support first
+        const audioSupport = checkAudioSupport();
+        if (!audioSupport.hasWebAudio || !audioSupport.hasGetUserMedia) {
+            throw new Error("Audio not supported in this browser");
+        }
+        // Call the start API endpoint to get Gemini Live session credentials
+        console.log("🚀 Starting Gemini Live session...");
         const response = await fetch("/api/start", {
-            method: "GET",
+            method: "POST",
             headers: {
                 "Content-Type": "application/json",
             },
+            body: JSON.stringify({
+                systemInstructions: systemPrompt.value
+            })
         });
         if (!response.ok) {
             throw new Error(`API error: ${response.statusText}`);
         }
         startResponse.value = await response.json();
-        config.apiKey = startResponse.value.ephemeralKey;
-        googleMapKey.value = startResponse.value.googleMapKey;
-        if (!config.apiKey) {
-            throw new Error("No ephemeral key received from server");
+        if (!startResponse.value) {
+            throw new Error("No response from server");
         }
-    }
-    catch (err) {
-        console.error("Failed to get ephemeral key:", err);
-        alert("Failed to start session. Check console for details.");
-        connecting.value = false;
-        return;
-    }
-    try {
-        webrtc.pc = new RTCPeerConnection();
-        // Data channel for model events
-        const dc = webrtc.pc.createDataChannel("oai-events");
-        webrtc.dc = dc;
-        dc.addEventListener("open", () => {
-            dc.send(JSON.stringify({
-                type: "session.update",
-                session: {
-                    type: "realtime",
-                    model: "gpt-realtime",
-                    instructions: systemPrompt.value,
-                    audio: {
-                        output: {
-                            voice: "shimmer",
-                        },
-                    },
-                    tools: pluginTools(startResponse.value),
-                },
-            }));
-        });
-        dc.addEventListener("message", messageHandler);
-        dc.addEventListener("close", () => {
-            webrtc.dc = null;
-        });
-        // Play remote audio
-        webrtc.remoteStream = new MediaStream();
-        webrtc.pc.ontrack = (event) => {
-            webrtc.remoteStream.addTrack(event.track);
+        googleMapKey.value = startResponse.value.googleMapKey || "";
+        if (!startResponse.value.ephemeralToken || !startResponse.value.websocketUrl) {
+            throw new Error("Invalid session response from server");
+        }
+        // Create session credentials
+        geminiLive.credentials = {
+            ephemeralToken: startResponse.value.ephemeralToken,
+            websocketUrl: startResponse.value.websocketUrl,
+            sessionId: `session-${Date.now()}`,
         };
+        // Initialize audio manager
+        console.log("🎤 Initializing audio...");
+        geminiLive.audioManager = createAudioStreamManager();
+        // Setup audio input
+        await geminiLive.audioManager.setupInput();
+        // Setup audio output
         if (audioEl.value) {
-            audioEl.value.srcObject = webrtc.remoteStream;
+            await geminiLive.audioManager.setupOutput();
         }
-        // Send microphone audio
-        webrtc.localStream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
+        // Start audio streaming
+        await geminiLive.audioManager.startStreaming();
+        // Initialize WebSocket client
+        console.log("🔌 Connecting to Gemini Live...");
+        geminiLive.wsClient = createWebSocketClient({
+            url: geminiLive.credentials.websocketUrl,
+            reconnectAttempts: 3,
+            reconnectDelay: 1000,
         });
-        webrtc.localStream
-            .getTracks()
-            .forEach((track) => webrtc.pc.addTrack(track, webrtc.localStream));
-        // Create and send offer SDP
-        const offer = await webrtc.pc.createOffer();
-        await webrtc.pc.setLocalDescription(offer);
-        const response = await fetch("https://api.openai.com/v1/realtime/calls", {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${config.apiKey}`,
-                "Content-Type": "application/sdp",
-            },
-            body: offer.sdp,
+        // Setup WebSocket event handlers
+        geminiLive.wsClient.onMessage(messageHandler);
+        geminiLive.wsClient.onStatusChange((status) => {
+            console.log("📡 WebSocket status:", status);
+            if (status === 'error') {
+                console.error("❌ WebSocket connection error");
+            }
         });
-        const responseText = await response.text();
-        await webrtc.pc.setRemoteDescription({ type: "answer", sdp: responseText });
+        geminiLive.wsClient.onError((error) => {
+            console.error("❌ WebSocket error:", error);
+        });
+        // Connect to Gemini Live
+        await geminiLive.wsClient.connect(geminiLive.credentials);
+        // Convert OpenAI tools to Gemini Live format and send initial setup message
+        const openaiTools = pluginTools(startResponse.value);
+        const geminiTools = ToolAdapter.convertToolsToGemini(openaiTools);
+        const setupMessage = createGeminiLiveSetupMessage(systemPrompt.value, geminiTools);
+        console.log("📤 Sending Gemini Live setup message:", JSON.stringify(setupMessage, null, 2));
+        await geminiLive.wsClient.sendMessage(setupMessage);
+        // Start audio streaming automatically
+        if (geminiLive.audioManager) {
+            await geminiLive.audioManager.startStreaming();
+            console.log("🎤 Audio streaming started");
+        }
+        // Setup audio data streaming
+        if (geminiLive.audioManager) {
+            geminiLive.audioManager.onAudioData(async (audioData) => {
+                if (!audioData || audioData.length === 0) {
+                    return;
+                }
+                // Update local microphone visualisation regardless of WebSocket status
+                let sum = 0;
+                for (let i = 0; i < audioData.length; i += 1) {
+                    const sample = audioData[i];
+                    sum += sample * sample;
+                }
+                const rms = Math.sqrt(sum / audioData.length);
+                const level = Math.min(1, rms * 12);
+                micLevel.value = level;
+                const nextWave = micWaveform.value.slice(-MAX_WAVEFORM_POINTS + 1);
+                nextWave.push(level);
+                micWaveform.value = nextWave;
+                if (geminiLive.wsClient && geminiLive.wsClient.isConnected.value) {
+                    try {
+                        const audioBase64 = arrayBufferToBase64(audioData.buffer);
+                        const audioMessage = {
+                            realtimeInput: {
+                                audio: {
+                                    mimeType: 'audio/raw;encoding=pcm16;rate=16000',
+                                    data: audioBase64,
+                                },
+                            },
+                        };
+                        await geminiLive.wsClient.sendMessage(audioMessage);
+                        console.log("🎵 Audio data sent to Gemini Live:", audioData.length);
+                    }
+                    catch (error) {
+                        console.error("❌ Failed to stream audio chunk:", error);
+                    }
+                }
+            });
+        }
         chatActive.value = true;
+        console.log("✅ Gemini Live session started successfully");
     }
     catch (err) {
-        console.error(err);
+        console.error("❌ Failed to start Gemini Live session:", err);
         stopChat();
-        alert("Failed to start voice chat. Check console for details.");
+        alert(`Failed to start voice chat: ${err instanceof Error ? err.message : 'Unknown error'}`);
     }
     finally {
         connecting.value = false;
     }
 }
-function sendTextMessage() {
+async function sendTextMessage() {
     const text = userInput.value.trim();
     if (!text)
         return;
-    const dc = webrtc.dc;
-    if (!chatActive.value || !dc || dc.readyState !== "open") {
-        console.warn("Cannot send text message because the data channel is not ready.");
+    if (!chatActive.value || !geminiLive.wsClient || !geminiLive.wsClient.isConnected.value) {
+        console.warn("Cannot send text message because WebSocket is not connected");
         return;
     }
-    dc.send(JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-            type: "message",
-            role: "user",
-            content: [
-                {
-                    type: "input_text",
-                    text,
-                },
-            ],
-        },
-    }));
-    dc.send(JSON.stringify({
-        type: "response.create",
-        response: {},
-    }));
-    messages.value.push(`You: ${text}`);
-    userInput.value = "";
+    try {
+        // Send text message to Gemini Live
+        const textMessage = createTextInputMessage(text);
+        await geminiLive.wsClient.sendMessage(textMessage);
+        // Add to local message history
+        messages.value.push(`You: ${text}`);
+        userInput.value = "";
+        console.log("📤 Text message sent:", text);
+    }
+    catch (error) {
+        console.error("❌ Failed to send text message:", error);
+    }
 }
-function stopChat() {
-    if (webrtc.pc) {
-        webrtc.pc.close();
-        webrtc.pc = null;
+// Utility function for audio data conversion
+function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
     }
-    if (webrtc.dc) {
-        webrtc.dc.close();
-        webrtc.dc = null;
+    return btoa(binary);
+}
+// Function to play audio from base64 data
+async function playAudioFromBase64(base64Data) {
+    try {
+        // Convert base64 to blob
+        const binaryString = atob(base64Data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        const audioBlob = new Blob([bytes], { type: 'audio/pcm' });
+        const audioUrl = URL.createObjectURL(audioBlob);
+        // Create and play audio element
+        const audio = new Audio(audioUrl);
+        audio.addEventListener('ended', () => {
+            URL.revokeObjectURL(audioUrl);
+        });
+        await audio.play();
+        console.log("🔊 Audio playback started");
     }
-    if (webrtc.localStream) {
-        webrtc.localStream.getTracks().forEach((track) => track.stop());
-        webrtc.localStream = null;
+    catch (error) {
+        console.error("❌ Failed to play audio:", error);
     }
-    if (webrtc.remoteStream) {
-        webrtc.remoteStream.getTracks().forEach((track) => track.stop());
-        webrtc.remoteStream = null;
+}
+async function stopChat() {
+    try {
+        // Disconnect WebSocket
+        if (geminiLive.wsClient) {
+            await geminiLive.wsClient.disconnect();
+            geminiLive.wsClient = null;
+        }
+        // Stop audio streaming
+        if (geminiLive.audioManager) {
+            await geminiLive.audioManager.stopStreaming();
+            geminiLive.audioManager = null;
+        }
+        // Clear audio element
+        if (audioEl.value) {
+            audioEl.value.srcObject = null;
+        }
+        // Clear session credentials
+        geminiLive.credentials = null;
+        chatActive.value = false;
+        console.log("🔌 Gemini Live session stopped");
     }
-    if (audioEl.value) {
-        audioEl.value.srcObject = null;
+    catch (error) {
+        console.error("❌ Error stopping chat:", error);
+        chatActive.value = false;
     }
-    chatActive.value = false;
 }
 debugger; /* PartiallyEnd: #3632/scriptSetup.vue */
 const __VLS_ctx = {};
@@ -413,6 +590,40 @@ __VLS_asFunctionalElement(__VLS_elements.audio, __VLS_elements.audio)({
 /** @type {typeof __VLS_ctx.audioEl} */ ;
 // @ts-ignore
 [audioEl,];
+__VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+    ...{ class: "space-y-1" },
+});
+__VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+    ...{ class: "text-xs text-gray-500 uppercase tracking-wide" },
+});
+__VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+    ...{ class: "h-2 bg-gray-200 rounded overflow-hidden" },
+});
+__VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+    ...{ class: "h-full bg-green-500 transition-all duration-100" },
+    ...{ style: ({ width: `${Math.round(__VLS_ctx.micLevel * 100)}%` }) },
+});
+// @ts-ignore
+[micLevel,];
+__VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+    ...{ class: "h-12 flex items-end space-x-1" },
+});
+for (const [level, index] of __VLS_getVForSourceType((__VLS_ctx.micWaveform))) {
+    // @ts-ignore
+    [micWaveform,];
+    __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+        key: (index),
+        ...{ class: "w-1 bg-green-400 rounded-t" },
+        ...{ style: ({ height: `${Math.max(4, Math.round(level * 100))}%` }) },
+    });
+}
+if (!__VLS_ctx.micWaveform.length) {
+    // @ts-ignore
+    [micWaveform,];
+    __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+        ...{ class: "text-xs text-gray-400" },
+    });
+}
 __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
     ...{ class: "flex-1 flex flex-col min-h-0" },
 });
@@ -762,6 +973,28 @@ if (__VLS_ctx.showConfigPopup) {
 /** @type {__VLS_StyleScopedClasses['bg-red-600']} */ ;
 /** @type {__VLS_StyleScopedClasses['text-white']} */ ;
 /** @type {__VLS_StyleScopedClasses['rounded']} */ ;
+/** @type {__VLS_StyleScopedClasses['space-y-1']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-xs']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-gray-500']} */ ;
+/** @type {__VLS_StyleScopedClasses['uppercase']} */ ;
+/** @type {__VLS_StyleScopedClasses['tracking-wide']} */ ;
+/** @type {__VLS_StyleScopedClasses['h-2']} */ ;
+/** @type {__VLS_StyleScopedClasses['bg-gray-200']} */ ;
+/** @type {__VLS_StyleScopedClasses['rounded']} */ ;
+/** @type {__VLS_StyleScopedClasses['overflow-hidden']} */ ;
+/** @type {__VLS_StyleScopedClasses['h-full']} */ ;
+/** @type {__VLS_StyleScopedClasses['bg-green-500']} */ ;
+/** @type {__VLS_StyleScopedClasses['transition-all']} */ ;
+/** @type {__VLS_StyleScopedClasses['duration-100']} */ ;
+/** @type {__VLS_StyleScopedClasses['h-12']} */ ;
+/** @type {__VLS_StyleScopedClasses['flex']} */ ;
+/** @type {__VLS_StyleScopedClasses['items-end']} */ ;
+/** @type {__VLS_StyleScopedClasses['space-x-1']} */ ;
+/** @type {__VLS_StyleScopedClasses['w-1']} */ ;
+/** @type {__VLS_StyleScopedClasses['bg-green-400']} */ ;
+/** @type {__VLS_StyleScopedClasses['rounded-t']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-xs']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-gray-400']} */ ;
 /** @type {__VLS_StyleScopedClasses['flex-1']} */ ;
 /** @type {__VLS_StyleScopedClasses['flex']} */ ;
 /** @type {__VLS_StyleScopedClasses['flex-col']} */ ;
@@ -986,6 +1219,8 @@ const __VLS_self = (await import('vue')).defineComponent({
         userInput: userInput,
         twitterEmbedData: twitterEmbedData,
         googleMapKey: googleMapKey,
+        micLevel: micLevel,
+        micWaveform: micWaveform,
         chatActive: chatActive,
         scrollCurrentResultToTop: scrollCurrentResultToTop,
         isTwitterUrl: isTwitterUrl,

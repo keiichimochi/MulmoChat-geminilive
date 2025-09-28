@@ -356,15 +356,15 @@ export function createGeminiLiveSetupMessage(
     generationConfig: {
       temperature: 0.7,
       maxOutputTokens: 8192,
+      responseModalities: ['TEXT', 'AUDIO'],
     },
-    responseModalities: ['TEXT', 'AUDIO'],
     systemInstruction: {
       role: 'system',
       parts: [{ text: systemInstructions }],
     },
     realtimeInputConfig: {
-      activityHandling: 'ACTIVITY_HANDLING_AUTOMATIC',
-      turnCoverage: 'TURN_COVERAGE_COMPLETE',
+      activityHandling: 'START_OF_ACTIVITY_INTERRUPTS',
+      turnCoverage: 'TURN_INCLUDES_ALL_INPUT',
     },
   };
 

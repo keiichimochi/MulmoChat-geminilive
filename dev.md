@@ -250,3 +250,49 @@ GOOGLE_MAP_API_KEY=your-google-maps-key      # 地図プラグイン
 - ✅ 型安全性 (TypeScript)
 
 **Final Status**: ✅ すべての移行作業完了 - 本番デプロイ準備完了
+
+## 最新アップデート (2025年9月28日)
+
+### UI/UX改善完了
+- ✅ **リアルタイムマイク入力可視化** - App.vue:47-64
+  - プログレスバー形式の音声レベル表示
+  - 波形データ可視化 (48ポイント)
+  - "Speak to see levels…" プレースホルダー
+  - 緑色のUI要素でアクティブ状態を直感的に表示
+
+```typescript
+// 音声レベル可視化の実装
+const micLevel = ref(0);
+const micWaveform = ref<number[]>([]);
+const MAX_WAVEFORM_POINTS = 48;
+
+// RMS計算による音声レベル取得
+const rms = Math.sqrt(sum / audioData.length);
+const level = Math.min(1, rms * 12);
+micLevel.value = level;
+```
+
+### Gemini Live設定最適化
+- ✅ **WebSocket設定調整** - webSocketClient.ts:356-370
+  - `responseModalities`: `generationConfig`内に移動
+  - `activityHandling`: `START_OF_ACTIVITY_INTERRUPTS`に変更
+  - `turnCoverage`: `TURN_INCLUDES_ALL_INPUT`に変更
+  - より安定した音声会話処理
+
+### 技術実装の改善
+- ✅ **音声ストリーミング処理強化** - App.vue:652-689
+  - WebSocket接続状態に関わらずローカル可視化を実行
+  - エラーハンドリングの向上
+  - パフォーマンス最適化（無駄な処理を削減）
+
+### 開発作業状況
+- **最新コミット**: `a3295d6` - TypeScript build修正
+- **未コミット変更**: 6ファイル（UI改善とGemini Live最適化）
+- **新規ファイル**: 4ファイル（JS生成物、削除対象）
+
+### 次の予定
+- [ ] 生成されたJSファイルのクリーンアップ（.gitignore更新）
+- [ ] WebSocket接続の詳細ログ改善
+- [ ] 本番環境での音声品質テスト
+
+**Current Status**: ✅ UI/UX完成 + Gemini Live最適化済み - 即座にデプロイ可能

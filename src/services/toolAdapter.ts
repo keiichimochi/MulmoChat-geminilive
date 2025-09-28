@@ -6,7 +6,7 @@
  * existing plugin system while working with the new API.
  */
 
-import type { GeminiTool } from '../../server/types';
+import type { GeminiTool, JSONSchema } from '../../server/types';
 import type { GeminiLiveMessage } from './webSocketClient';
 
 /**
@@ -20,6 +20,7 @@ export interface OpenAIToolDefinition {
     type: "object";
     properties: Record<string, any>;
     required: string[];
+    [key: string]: unknown;
   };
 }
 
@@ -50,6 +51,32 @@ export interface GeminiToolResponse extends GeminiLiveMessage {
  */
 export class ToolAdapter {
   /**
+   * Remove OpenAPI-specific fields that Gemini Live does not accept.
+   */
+  private static sanitizeSchema(schema: unknown): JSONSchema {
+    if (!schema || typeof schema !== 'object') {
+      return {} as JSONSchema;
+    }
+
+    const { additionalProperties, ...rest } = schema as Record<string, unknown>;
+    const sanitized = { ...rest } as JSONSchema;
+
+    if (sanitized.properties && typeof sanitized.properties === 'object') {
+      const cleanedProps: Record<string, JSONSchema> = {};
+      const original = sanitized.properties as Record<string, unknown>;
+      for (const [key, value] of Object.entries(original)) {
+        cleanedProps[key] = this.sanitizeSchema(value);
+      }
+      sanitized.properties = cleanedProps;
+    }
+
+    if (sanitized.items) {
+      sanitized.items = this.sanitizeSchema(sanitized.items);
+    }
+
+    return sanitized;
+  }
+  /**
    * Convert OpenAI function definition to Gemini Live tool definition
    */
   static convertToGeminiTool(openaiTool: OpenAIToolDefinition): GeminiTool {
@@ -57,11 +84,7 @@ export class ToolAdapter {
       functionDeclarations: [{
         name: openaiTool.name,
         description: openaiTool.description,
-        parameters: {
-          type: openaiTool.parameters.type,
-          properties: openaiTool.parameters.properties,
-          required: openaiTool.parameters.required,
-        },
+        parameters: this.sanitizeSchema(openaiTool.parameters),
       }],
     };
   }

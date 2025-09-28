@@ -44,6 +44,24 @@
             Stop Voice Chat
           </button>
           <audio ref="audioEl" autoplay></audio>
+          <div class="space-y-1">
+            <div class="text-xs text-gray-500 uppercase tracking-wide">Mic Input</div>
+            <div class="h-2 bg-gray-200 rounded overflow-hidden">
+              <div
+                class="h-full bg-green-500 transition-all duration-100"
+                :style="{ width: `${Math.round(micLevel * 100)}%` }"
+              ></div>
+            </div>
+            <div class="h-12 flex items-end space-x-1">
+              <div
+                v-for="(level, index) in micWaveform"
+                :key="index"
+                class="w-1 bg-green-400 rounded-t"
+                :style="{ height: `${Math.max(4, Math.round(level * 100))}%` }"
+              ></div>
+              <div v-if="!micWaveform.length" class="text-xs text-gray-400">Speak to see levels…</div>
+            </div>
+          </div>
         </div>
 
         <!-- Generated images container -->
@@ -316,6 +334,9 @@ const userInput = ref("");
 const twitterEmbedData = ref<Record<string, string | null>>({});
 const googleMapKey = ref<string | null>(null);
 const startResponse = ref<StartApiResponse | null>(null);
+const micLevel = ref(0);
+const micWaveform = ref<number[]>([]);
+const MAX_WAVEFORM_POINTS = 48;
 
 watch(systemPrompt, (val) => {
   localStorage.setItem(SYSTEM_PROMPT_KEY, val);
@@ -768,20 +789,40 @@ async function startChat(): Promise<void> {
     // Setup audio data streaming
     if (geminiLive.audioManager) {
       geminiLive.audioManager.onAudioData(async (audioData) => {
+        if (!audioData || audioData.length === 0) {
+          return;
+        }
+
+        // Update local microphone visualisation regardless of WebSocket status
+        let sum = 0;
+        for (let i = 0; i < audioData.length; i += 1) {
+          const sample = audioData[i];
+          sum += sample * sample;
+        }
+        const rms = Math.sqrt(sum / audioData.length);
+        const level = Math.min(1, rms * 12);
+        micLevel.value = level;
+        const nextWave = micWaveform.value.slice(-MAX_WAVEFORM_POINTS + 1);
+        nextWave.push(level);
+        micWaveform.value = nextWave;
+
         if (geminiLive.wsClient && geminiLive.wsClient.isConnected.value) {
-          // Convert audio data to base64 for WebSocket transmission
-          const audioBase64 = arrayBufferToBase64(audioData.buffer);
+          try {
+            const audioBase64 = arrayBufferToBase64(audioData.buffer);
+            const audioMessage = {
+              realtimeInput: {
+                audio: {
+                  mimeType: 'audio/raw;encoding=pcm16;rate=16000',
+                  data: audioBase64,
+                },
+              },
+            };
 
-          const audioMessage = {
-            realtimeInput: {
-              audio: {
-                data: audioBase64
-              }
-            }
-          };
-
-          await geminiLive.wsClient.sendMessage(audioMessage);
-          console.log("🎵 Audio data sent to Gemini Live:", audioData.length);
+            await geminiLive.wsClient.sendMessage(audioMessage);
+            console.log("🎵 Audio data sent to Gemini Live:", audioData.length);
+          } catch (error) {
+            console.error("❌ Failed to stream audio chunk:", error);
+          }
         }
       });
     }

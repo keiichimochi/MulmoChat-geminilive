@@ -313,7 +313,7 @@ const pendingToolArgs: Record<string, string> = {};
 const showConfigPopup = ref(false);
 const selectedResult = ref<PluginResult | null>(null);
 const userInput = ref("");
-const twitterEmbedData = ref<{ [key: string]: string }>({});
+const twitterEmbedData = ref<Record<string, string | null>>({});
 const googleMapKey = ref<string | null>(null);
 const startResponse = ref<StartApiResponse | null>(null);
 
@@ -334,6 +334,114 @@ const geminiLive = {
   audioManager: null as AudioStreamManager | null,
   credentials: null as SessionCredentials | null,
 };
+
+type InlineAudioData = {
+  mimeType?: string;
+  data?: string;
+};
+
+interface GeminiServerContentPart {
+  text?: string;
+  inlineData?: InlineAudioData;
+}
+
+interface GeminiServerContent {
+  modelTurn?: {
+    parts?: GeminiServerContentPart[];
+  };
+  turnComplete?: boolean;
+  generationComplete?: boolean;
+}
+
+interface GeminiFunctionCall {
+  id?: string;
+  name: string;
+  args?: Record<string, unknown>;
+}
+
+interface GeminiToolCallPayload {
+  functionCalls?: GeminiFunctionCall[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isInlineAudioData(value: unknown): value is InlineAudioData {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (value.mimeType !== undefined && typeof value.mimeType !== "string") {
+    return false;
+  }
+  if (value.data !== undefined && typeof value.data !== "string") {
+    return false;
+  }
+  return true;
+}
+
+function isGeminiServerContentPart(value: unknown): value is GeminiServerContentPart {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (value.text !== undefined && typeof value.text !== "string") {
+    return false;
+  }
+  if (value.inlineData !== undefined && !isInlineAudioData(value.inlineData)) {
+    return false;
+  }
+  return true;
+}
+
+function isGeminiServerContent(value: unknown): value is GeminiServerContent {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const maybe = value as GeminiServerContent;
+  if (maybe.modelTurn !== undefined) {
+    if (!isRecord(maybe.modelTurn)) {
+      return false;
+    }
+    const parts = maybe.modelTurn.parts;
+    if (parts !== undefined && (!Array.isArray(parts) || !parts.every(isGeminiServerContentPart))) {
+      return false;
+    }
+  }
+  if (maybe.turnComplete !== undefined && typeof maybe.turnComplete !== "boolean") {
+    return false;
+  }
+  if (maybe.generationComplete !== undefined && typeof maybe.generationComplete !== "boolean") {
+    return false;
+  }
+  return true;
+}
+
+function isGeminiFunctionCall(value: unknown): value is GeminiFunctionCall {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (typeof value.name !== "string") {
+    return false;
+  }
+  if (value.args !== undefined && !isRecord(value.args)) {
+    return false;
+  }
+  if (value.id !== undefined && typeof value.id !== "string") {
+    return false;
+  }
+  return true;
+}
+
+function isGeminiToolCallPayload(value: unknown): value is GeminiToolCallPayload {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const functionCalls = value.functionCalls;
+  if (functionCalls === undefined) {
+    return true;
+  }
+  return Array.isArray(functionCalls) && functionCalls.every(isGeminiFunctionCall);
+}
 
 function scrollToBottomOfImageContainer(): void {
   nextTick(() => {
@@ -436,7 +544,7 @@ async function messageHandler(message: GeminiLiveMessage): Promise<void> {
       return;
     }
 
-    if (message.serverContent) {
+    if (isGeminiServerContent(message.serverContent)) {
       const serverContent = message.serverContent;
 
       // Handle model turn with text and audio content
@@ -463,19 +571,29 @@ async function messageHandler(message: GeminiLiveMessage): Promise<void> {
       }
     }
 
-    if (message.toolCall) {
+    if (isGeminiToolCallPayload(message.toolCall)) {
       // Handle tool calls in Gemini Live format
       const toolCall = message.toolCall;
       console.log("🔧 Received tool call:", toolCall);
 
       if (toolCall.functionCalls) {
         for (const functionCall of toolCall.functionCalls) {
-          await processGeminiToolCall({
+          if (typeof functionCall.name !== "string") {
+            console.warn("Skipping invalid tool call without name", functionCall);
+            continue;
+          }
+
+          const callMessage: GeminiToolCall = {
             type: "tool.call",
-            call_id: functionCall.id || `call_${Date.now()}`,
+            call_id:
+              functionCall.id && functionCall.id.length > 0
+                ? functionCall.id
+                : `call_${Date.now()}_${Math.random().toString(36).slice(2)}`,
             name: functionCall.name,
-            args: functionCall.args || {},
-          } as GeminiLiveMessage);
+            args: functionCall.args ?? {},
+          };
+
+          await processGeminiToolCall(callMessage);
         }
       }
     }
@@ -485,14 +603,14 @@ async function messageHandler(message: GeminiLiveMessage): Promise<void> {
   }
 }
 
-async function processGeminiToolCall(message: GeminiLiveMessage): Promise<void> {
-  // Validate tool call format using adapter
+async function processGeminiToolCall(message: GeminiToolCall): Promise<void> {
+  // Validate tool call format using adapter (extra safety)
   if (!ToolAdapter.isValidGeminiToolCall(message)) {
     console.error("❌ Invalid Gemini tool call format:", message);
     return;
   }
 
-  const toolCallMessage = message as GeminiToolCall;
+  const toolCallMessage = message;
   const { toolName, args, callId } = ToolAdapter.extractToolCallArgs(toolCallMessage);
 
   try {
@@ -705,7 +823,7 @@ async function sendTextMessage(): Promise<void> {
 }
 
 // Utility function for audio data conversion
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
+function arrayBufferToBase64(buffer: ArrayBufferLike): string {
   const bytes = new Uint8Array(buffer);
   let binary = '';
   const len = bytes.byteLength;

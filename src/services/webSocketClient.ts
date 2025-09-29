@@ -37,6 +37,8 @@ export class WebSocketClient {
   private reconnectCount = 0;
   private reconnectTimer: number | null = null;
   private isIntentionalDisconnect = false;
+  private keepAliveTimer: number | null = null;
+  private lastMessageTime: number = 0;
 
   // Reactive state
   public readonly status: Ref<ConnectionStatus> = ref('disconnected');
@@ -112,6 +114,7 @@ export class WebSocketClient {
   async disconnect(): Promise<void> {
     this.isIntentionalDisconnect = true;
     this.clearReconnectTimer();
+    this.clearKeepAliveTimer();
 
     if (this.ws) {
       this.ws.close();
@@ -219,6 +222,10 @@ export class WebSocketClient {
       this.setStatus('connected');
       this.reconnectCount = 0;
       this.lastError.value = null;
+      this.lastMessageTime = Date.now();
+
+      // Start keepalive timer
+      this.startKeepAlive();
 
       // Note: setup message will be sent separately via sendMessage
       // The Live API requires initial setup configuration after connection
@@ -226,6 +233,8 @@ export class WebSocketClient {
 
     this.ws.onmessage = (event) => {
       try {
+        this.lastMessageTime = Date.now();
+        
         const message: GeminiLiveMessage = JSON.parse(event.data);
 
         console.log('📥 Received message from Gemini Live:', {
@@ -301,6 +310,39 @@ export class WebSocketClient {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+  }
+
+  private startKeepAlive(): void {
+    this.clearKeepAliveTimer();
+    
+    // Check connection health every 30 seconds
+    this.keepAliveTimer = window.setInterval(() => {
+      const now = Date.now();
+      const timeSinceLastMessage = now - this.lastMessageTime;
+      
+      // If no message received in 60 seconds, connection might be stale
+      if (timeSinceLastMessage > 60000) {
+        console.warn('⚠️ No messages received for 60 seconds, connection may be stale');
+      }
+      
+      // Send a ping to keep connection alive if idle for more than 20 seconds
+      if (timeSinceLastMessage > 20000 && this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          // Send a minimal message to keep connection alive
+          this.ws.send(JSON.stringify({ keepalive: true }));
+          console.log('💓 Sent keepalive ping');
+        } catch (error) {
+          console.error('❌ Failed to send keepalive:', error);
+        }
+      }
+    }, 30000); // Check every 30 seconds
+  }
+
+  private clearKeepAliveTimer(): void {
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
     }
   }
 

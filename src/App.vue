@@ -45,7 +45,10 @@
           </button>
           <audio ref="audioEl" autoplay></audio>
           <div class="space-y-1">
-            <div class="text-xs text-gray-500 uppercase tracking-wide">Mic Input</div>
+            <div class="text-xs text-gray-500 uppercase tracking-wide flex items-center justify-between">
+              <span>Mic Input</span>
+              <span v-if="isRecognizing" class="text-green-600 animate-pulse">● Recognizing</span>
+            </div>
             <div class="h-2 bg-gray-200 rounded overflow-hidden">
               <div
                 class="h-full bg-green-500 transition-all duration-100"
@@ -164,7 +167,34 @@
       </div>
 
       <!-- Main content -->
-      <div class="flex-1 flex flex-col">
+      <div class="flex-1 flex flex-col space-y-4">
+        <!-- Conversation Messages -->
+        <div class="h-48 border rounded bg-white p-4 overflow-y-auto">
+          <div class="space-y-2">
+            <div v-if="messages.length === 0" class="text-gray-400 text-sm italic">
+              Conversation will appear here...
+            </div>
+            <div
+              v-for="(message, index) in messages"
+              :key="index"
+              class="p-2 rounded"
+              :class="{
+                'bg-blue-50 text-blue-900': message.startsWith('You'),
+                'bg-gray-50 text-gray-900': message.startsWith('Assistant'),
+                'bg-gray-100 text-gray-700': !message.startsWith('You') && !message.startsWith('Assistant')
+              }"
+            >
+              {{ message }}
+            </div>
+            <div v-if="currentText" class="p-2 rounded bg-gray-50 text-gray-900">
+              <span class="font-medium">Assistant:</span> {{ currentText }}...
+            </div>
+            <div v-if="interimTranscript" class="p-2 rounded bg-blue-100 text-blue-700 italic">
+              <span class="font-medium">You (speaking):</span> {{ interimTranscript }}...
+            </div>
+          </div>
+        </div>
+
         <div class="flex-1 border rounded bg-gray-50 overflow-hidden">
           <div
             v-if="selectedResult?.url && isTwitterUrl(selectedResult.url)"
@@ -291,6 +321,30 @@ import {
   pluginGeneratingMessage,
   pluginWaitingMessage,
 } from "./plugins/type";
+
+// Web Speech API types
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start(): void;
+  stop(): void;
+  onstart: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onend: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onerror: ((this: SpeechRecognition, ev: any) => any) | null;
+  onresult: ((this: SpeechRecognition, ev: any) => any) | null;
+}
+
+interface SpeechRecognitionConstructor {
+  new (): SpeechRecognition;
+}
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecognitionConstructor;
+    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+  }
+}
 import type { StartApiResponse } from "../server/types";
 // @ts-ignore
 import GoogleMap from "./components/GoogleMap.vue";
@@ -356,6 +410,12 @@ const geminiLive = {
   credentials: null as SessionCredentials | null,
 };
 
+// Speech Recognition for local transcription
+const recognition = ref<SpeechRecognition | null>(null);
+const isRecognizing = ref(false);
+const localTranscript = ref("");
+const interimTranscript = ref("");
+
 type InlineAudioData = {
   mimeType?: string;
   data?: string;
@@ -369,6 +429,9 @@ interface GeminiServerContentPart {
 interface GeminiServerContent {
   modelTurn?: {
     parts?: GeminiServerContentPart[];
+  };
+  transcript?: {
+    text?: string;
   };
   turnComplete?: boolean;
   generationComplete?: boolean;
@@ -568,6 +631,15 @@ async function messageHandler(message: GeminiLiveMessage): Promise<void> {
     if (isGeminiServerContent(message.serverContent)) {
       const serverContent = message.serverContent;
 
+      // Handle user transcription (speech-to-text result)
+      if (serverContent.transcript) {
+        const transcript = serverContent.transcript;
+        if (transcript.text) {
+          console.log("🎤 User speech transcribed:", transcript.text);
+          messages.value.push(`You (voice): ${transcript.text}`);
+        }
+      }
+
       // Handle model turn with text and audio content
       if (serverContent.modelTurn?.parts) {
         for (const part of serverContent.modelTurn.parts) {
@@ -586,7 +658,7 @@ async function messageHandler(message: GeminiLiveMessage): Promise<void> {
       // Handle completion
       if (serverContent.turnComplete || serverContent.generationComplete) {
         if (currentText.value.trim()) {
-          messages.value.push(currentText.value);
+          messages.value.push(`Assistant: ${currentText.value}`);
         }
         currentText.value = "";
       }
@@ -734,18 +806,7 @@ async function startChat(): Promise<void> {
     console.log("🎤 Initializing audio...");
     geminiLive.audioManager = createAudioStreamManager();
 
-    // Setup audio input
-    await geminiLive.audioManager.setupInput();
-
-    // Setup audio output
-    if (audioEl.value) {
-      await geminiLive.audioManager.setupOutput();
-    }
-
-    // Start audio streaming
-    await geminiLive.audioManager.startStreaming();
-
-    // Initialize WebSocket client
+    // Initialize WebSocket client FIRST
     console.log("🔌 Connecting to Gemini Live...");
     geminiLive.wsClient = createWebSocketClient({
       url: geminiLive.credentials.websocketUrl,
@@ -768,6 +829,9 @@ async function startChat(): Promise<void> {
     // Connect to Gemini Live
     await geminiLive.wsClient.connect(geminiLive.credentials);
 
+    // Wait a bit for the connection to stabilize
+    await new Promise(resolve => setTimeout(resolve, 100));
+
     // Convert OpenAI tools to Gemini Live format and send initial setup message
     const openaiTools = pluginTools(startResponse.value);
     const geminiTools = ToolAdapter.convertToolsToGemini(openaiTools);
@@ -780,11 +844,21 @@ async function startChat(): Promise<void> {
     console.log("📤 Sending Gemini Live setup message:", JSON.stringify(setupMessage, null, 2));
     await geminiLive.wsClient.sendMessage(setupMessage);
 
-    // Start audio streaming automatically
-    if (geminiLive.audioManager) {
-      await geminiLive.audioManager.startStreaming();
-      console.log("🎤 Audio streaming started");
+    // Wait for setup to complete
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    // Setup audio input
+    console.log("🎤 Setting up audio input...");
+    await geminiLive.audioManager.setupInput();
+
+    // Setup audio output
+    if (audioEl.value) {
+      await geminiLive.audioManager.setupOutput();
     }
+
+    // Start audio streaming
+    await geminiLive.audioManager.startStreaming();
+    console.log("🎤 Audio streaming started");
 
     // Setup audio data streaming
     if (geminiLive.audioManager) {
@@ -827,6 +901,9 @@ async function startChat(): Promise<void> {
       });
     }
 
+    // Start local speech recognition for transcription
+    startSpeechRecognition();
+
     chatActive.value = true;
     console.log("✅ Gemini Live session started successfully");
 
@@ -836,6 +913,100 @@ async function startChat(): Promise<void> {
     alert(`Failed to start voice chat: ${err instanceof Error ? err.message : 'Unknown error'}`);
   } finally {
     connecting.value = false;
+  }
+}
+
+function startSpeechRecognition(): void {
+  try {
+    // Check if Web Speech API is available
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    
+    if (!SpeechRecognition) {
+      console.warn("⚠️ Speech Recognition API not supported in this browser");
+      return;
+    }
+
+    const recognitionInstance = new SpeechRecognition();
+    recognition.value = recognitionInstance;
+    
+    recognitionInstance.continuous = true;
+    recognitionInstance.interimResults = true;
+    recognitionInstance.lang = 'ja-JP'; // 日本語設定、必要に応じて変更可能
+
+    recognitionInstance.onstart = () => {
+      isRecognizing.value = true;
+      console.log("🎤 Speech recognition started");
+    };
+
+    recognitionInstance.onresult = (event: any) => {
+      let interim = "";
+      let final = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          final += transcript;
+        } else {
+          interim += transcript;
+        }
+      }
+
+      if (final) {
+        localTranscript.value = final;
+        messages.value.push(`You (voice): ${final}`);
+        console.log("🎤 Final transcript:", final);
+        // Clear interim after final result
+        interimTranscript.value = "";
+      } else {
+        interimTranscript.value = interim;
+      }
+    };
+
+    recognitionInstance.onerror = (event: any) => {
+      console.error("❌ Speech recognition error:", event.error);
+      if (event.error === 'no-speech') {
+        console.log("ℹ️ No speech detected, continuing...");
+      }
+    };
+
+    recognitionInstance.onend = () => {
+      isRecognizing.value = false;
+      console.log("🎤 Speech recognition ended");
+      
+      // Restart if chat is still active
+      if (chatActive.value) {
+        setTimeout(() => {
+          if (chatActive.value && recognition.value) {
+            try {
+              recognition.value.start();
+            } catch (e) {
+              console.warn("⚠️ Could not restart speech recognition:", e);
+            }
+          }
+        }, 100);
+      }
+    };
+
+    recognitionInstance.start();
+    console.log("🎤 Speech recognition initialized");
+
+  } catch (error) {
+    console.error("❌ Failed to initialize speech recognition:", error);
+  }
+}
+
+function stopSpeechRecognition(): void {
+  if (recognition.value) {
+    try {
+      recognition.value.stop();
+      recognition.value = null;
+      isRecognizing.value = false;
+      localTranscript.value = "";
+      interimTranscript.value = "";
+      console.log("🎤 Speech recognition stopped");
+    } catch (error) {
+      console.error("❌ Failed to stop speech recognition:", error);
+    }
   }
 }
 
@@ -902,6 +1073,9 @@ async function playAudioFromBase64(base64Data: string): Promise<void> {
 
 async function stopChat(): Promise<void> {
   try {
+    // Stop speech recognition
+    stopSpeechRecognition();
+
     // Disconnect WebSocket
     if (geminiLive.wsClient) {
       await geminiLive.wsClient.disconnect();

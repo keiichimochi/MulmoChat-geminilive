@@ -41,6 +41,11 @@ const geminiLive = {
     audioManager: null,
     credentials: null,
 };
+// Speech Recognition for local transcription
+const recognition = ref(null);
+const isRecognizing = ref(false);
+const localTranscript = ref("");
+const interimTranscript = ref("");
 function isRecord(value) {
     return typeof value === "object" && value !== null;
 }
@@ -204,6 +209,14 @@ async function messageHandler(message) {
         }
         if (isGeminiServerContent(message.serverContent)) {
             const serverContent = message.serverContent;
+            // Handle user transcription (speech-to-text result)
+            if (serverContent.transcript) {
+                const transcript = serverContent.transcript;
+                if (transcript.text) {
+                    console.log("🎤 User speech transcribed:", transcript.text);
+                    messages.value.push(`You (voice): ${transcript.text}`);
+                }
+            }
             // Handle model turn with text and audio content
             if (serverContent.modelTurn?.parts) {
                 for (const part of serverContent.modelTurn.parts) {
@@ -220,7 +233,7 @@ async function messageHandler(message) {
             // Handle completion
             if (serverContent.turnComplete || serverContent.generationComplete) {
                 if (currentText.value.trim()) {
-                    messages.value.push(currentText.value);
+                    messages.value.push(`Assistant: ${currentText.value}`);
                 }
                 currentText.value = "";
             }
@@ -343,15 +356,7 @@ async function startChat() {
         // Initialize audio manager
         console.log("🎤 Initializing audio...");
         geminiLive.audioManager = createAudioStreamManager();
-        // Setup audio input
-        await geminiLive.audioManager.setupInput();
-        // Setup audio output
-        if (audioEl.value) {
-            await geminiLive.audioManager.setupOutput();
-        }
-        // Start audio streaming
-        await geminiLive.audioManager.startStreaming();
-        // Initialize WebSocket client
+        // Initialize WebSocket client FIRST
         console.log("🔌 Connecting to Gemini Live...");
         geminiLive.wsClient = createWebSocketClient({
             url: geminiLive.credentials.websocketUrl,
@@ -371,17 +376,26 @@ async function startChat() {
         });
         // Connect to Gemini Live
         await geminiLive.wsClient.connect(geminiLive.credentials);
+        // Wait a bit for the connection to stabilize
+        await new Promise(resolve => setTimeout(resolve, 100));
         // Convert OpenAI tools to Gemini Live format and send initial setup message
         const openaiTools = pluginTools(startResponse.value);
         const geminiTools = ToolAdapter.convertToolsToGemini(openaiTools);
         const setupMessage = createGeminiLiveSetupMessage(systemPrompt.value, geminiTools);
         console.log("📤 Sending Gemini Live setup message:", JSON.stringify(setupMessage, null, 2));
         await geminiLive.wsClient.sendMessage(setupMessage);
-        // Start audio streaming automatically
-        if (geminiLive.audioManager) {
-            await geminiLive.audioManager.startStreaming();
-            console.log("🎤 Audio streaming started");
+        // Wait for setup to complete
+        await new Promise(resolve => setTimeout(resolve, 200));
+        // Setup audio input
+        console.log("🎤 Setting up audio input...");
+        await geminiLive.audioManager.setupInput();
+        // Setup audio output
+        if (audioEl.value) {
+            await geminiLive.audioManager.setupOutput();
         }
+        // Start audio streaming
+        await geminiLive.audioManager.startStreaming();
+        console.log("🎤 Audio streaming started");
         // Setup audio data streaming
         if (geminiLive.audioManager) {
             geminiLive.audioManager.onAudioData(async (audioData) => {
@@ -420,6 +434,8 @@ async function startChat() {
                 }
             });
         }
+        // Start local speech recognition for transcription
+        startSpeechRecognition();
         chatActive.value = true;
         console.log("✅ Gemini Live session started successfully");
     }
@@ -430,6 +446,91 @@ async function startChat() {
     }
     finally {
         connecting.value = false;
+    }
+}
+function startSpeechRecognition() {
+    try {
+        // Check if Web Speech API is available
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            console.warn("⚠️ Speech Recognition API not supported in this browser");
+            return;
+        }
+        const recognitionInstance = new SpeechRecognition();
+        recognition.value = recognitionInstance;
+        recognitionInstance.continuous = true;
+        recognitionInstance.interimResults = true;
+        recognitionInstance.lang = 'ja-JP'; // 日本語設定、必要に応じて変更可能
+        recognitionInstance.onstart = () => {
+            isRecognizing.value = true;
+            console.log("🎤 Speech recognition started");
+        };
+        recognitionInstance.onresult = (event) => {
+            let interim = "";
+            let final = "";
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const transcript = event.results[i][0].transcript;
+                if (event.results[i].isFinal) {
+                    final += transcript;
+                }
+                else {
+                    interim += transcript;
+                }
+            }
+            if (final) {
+                localTranscript.value = final;
+                messages.value.push(`You (voice): ${final}`);
+                console.log("🎤 Final transcript:", final);
+                // Clear interim after final result
+                interimTranscript.value = "";
+            }
+            else {
+                interimTranscript.value = interim;
+            }
+        };
+        recognitionInstance.onerror = (event) => {
+            console.error("❌ Speech recognition error:", event.error);
+            if (event.error === 'no-speech') {
+                console.log("ℹ️ No speech detected, continuing...");
+            }
+        };
+        recognitionInstance.onend = () => {
+            isRecognizing.value = false;
+            console.log("🎤 Speech recognition ended");
+            // Restart if chat is still active
+            if (chatActive.value) {
+                setTimeout(() => {
+                    if (chatActive.value && recognition.value) {
+                        try {
+                            recognition.value.start();
+                        }
+                        catch (e) {
+                            console.warn("⚠️ Could not restart speech recognition:", e);
+                        }
+                    }
+                }, 100);
+            }
+        };
+        recognitionInstance.start();
+        console.log("🎤 Speech recognition initialized");
+    }
+    catch (error) {
+        console.error("❌ Failed to initialize speech recognition:", error);
+    }
+}
+function stopSpeechRecognition() {
+    if (recognition.value) {
+        try {
+            recognition.value.stop();
+            recognition.value = null;
+            isRecognizing.value = false;
+            localTranscript.value = "";
+            interimTranscript.value = "";
+            console.log("🎤 Speech recognition stopped");
+        }
+        catch (error) {
+            console.error("❌ Failed to stop speech recognition:", error);
+        }
     }
 }
 async function sendTextMessage() {
@@ -488,6 +589,8 @@ async function playAudioFromBase64(base64Data) {
 }
 async function stopChat() {
     try {
+        // Stop speech recognition
+        stopSpeechRecognition();
         // Disconnect WebSocket
         if (geminiLive.wsClient) {
             await geminiLive.wsClient.disconnect();
@@ -594,8 +697,16 @@ __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
     ...{ class: "space-y-1" },
 });
 __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
-    ...{ class: "text-xs text-gray-500 uppercase tracking-wide" },
+    ...{ class: "text-xs text-gray-500 uppercase tracking-wide flex items-center justify-between" },
 });
+__VLS_asFunctionalElement(__VLS_elements.span, __VLS_elements.span)({});
+if (__VLS_ctx.isRecognizing) {
+    // @ts-ignore
+    [isRecognizing,];
+    __VLS_asFunctionalElement(__VLS_elements.span, __VLS_elements.span)({
+        ...{ class: "text-green-600 animate-pulse" },
+    });
+}
 __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
     ...{ class: "h-2 bg-gray-200 rounded overflow-hidden" },
 });
@@ -753,8 +864,61 @@ __VLS_asFunctionalElement(__VLS_elements.button, __VLS_elements.button)({
 // @ts-ignore
 [chatActive, sendTextMessage, userInput,];
 __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
-    ...{ class: "flex-1 flex flex-col" },
+    ...{ class: "flex-1 flex flex-col space-y-4" },
 });
+__VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+    ...{ class: "h-48 border rounded bg-white p-4 overflow-y-auto" },
+});
+__VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+    ...{ class: "space-y-2" },
+});
+if (__VLS_ctx.messages.length === 0) {
+    // @ts-ignore
+    [messages,];
+    __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+        ...{ class: "text-gray-400 text-sm italic" },
+    });
+}
+for (const [message, index] of __VLS_getVForSourceType((__VLS_ctx.messages))) {
+    // @ts-ignore
+    [messages,];
+    __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+        key: (index),
+        ...{ class: "p-2 rounded" },
+        ...{ class: ({
+                'bg-blue-50 text-blue-900': message.startsWith('You'),
+                'bg-gray-50 text-gray-900': message.startsWith('Assistant'),
+                'bg-gray-100 text-gray-700': !message.startsWith('You') && !message.startsWith('Assistant')
+            }) },
+    });
+    (message);
+}
+if (__VLS_ctx.currentText) {
+    // @ts-ignore
+    [currentText,];
+    __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+        ...{ class: "p-2 rounded bg-gray-50 text-gray-900" },
+    });
+    __VLS_asFunctionalElement(__VLS_elements.span, __VLS_elements.span)({
+        ...{ class: "font-medium" },
+    });
+    (__VLS_ctx.currentText);
+    // @ts-ignore
+    [currentText,];
+}
+if (__VLS_ctx.interimTranscript) {
+    // @ts-ignore
+    [interimTranscript,];
+    __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
+        ...{ class: "p-2 rounded bg-blue-100 text-blue-700 italic" },
+    });
+    __VLS_asFunctionalElement(__VLS_elements.span, __VLS_elements.span)({
+        ...{ class: "font-medium" },
+    });
+    (__VLS_ctx.interimTranscript);
+    // @ts-ignore
+    [interimTranscript,];
+}
 __VLS_asFunctionalElement(__VLS_elements.div, __VLS_elements.div)({
     ...{ class: "flex-1 border rounded bg-gray-50 overflow-hidden" },
 });
@@ -978,6 +1142,11 @@ if (__VLS_ctx.showConfigPopup) {
 /** @type {__VLS_StyleScopedClasses['text-gray-500']} */ ;
 /** @type {__VLS_StyleScopedClasses['uppercase']} */ ;
 /** @type {__VLS_StyleScopedClasses['tracking-wide']} */ ;
+/** @type {__VLS_StyleScopedClasses['flex']} */ ;
+/** @type {__VLS_StyleScopedClasses['items-center']} */ ;
+/** @type {__VLS_StyleScopedClasses['justify-between']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-green-600']} */ ;
+/** @type {__VLS_StyleScopedClasses['animate-pulse']} */ ;
 /** @type {__VLS_StyleScopedClasses['h-2']} */ ;
 /** @type {__VLS_StyleScopedClasses['bg-gray-200']} */ ;
 /** @type {__VLS_StyleScopedClasses['rounded']} */ ;
@@ -1092,6 +1261,36 @@ if (__VLS_ctx.showConfigPopup) {
 /** @type {__VLS_StyleScopedClasses['flex-1']} */ ;
 /** @type {__VLS_StyleScopedClasses['flex']} */ ;
 /** @type {__VLS_StyleScopedClasses['flex-col']} */ ;
+/** @type {__VLS_StyleScopedClasses['space-y-4']} */ ;
+/** @type {__VLS_StyleScopedClasses['h-48']} */ ;
+/** @type {__VLS_StyleScopedClasses['border']} */ ;
+/** @type {__VLS_StyleScopedClasses['rounded']} */ ;
+/** @type {__VLS_StyleScopedClasses['bg-white']} */ ;
+/** @type {__VLS_StyleScopedClasses['p-4']} */ ;
+/** @type {__VLS_StyleScopedClasses['overflow-y-auto']} */ ;
+/** @type {__VLS_StyleScopedClasses['space-y-2']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-gray-400']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-sm']} */ ;
+/** @type {__VLS_StyleScopedClasses['italic']} */ ;
+/** @type {__VLS_StyleScopedClasses['p-2']} */ ;
+/** @type {__VLS_StyleScopedClasses['rounded']} */ ;
+/** @type {__VLS_StyleScopedClasses['bg-blue-50']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-blue-900']} */ ;
+/** @type {__VLS_StyleScopedClasses['bg-gray-50']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-gray-900']} */ ;
+/** @type {__VLS_StyleScopedClasses['bg-gray-100']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-gray-700']} */ ;
+/** @type {__VLS_StyleScopedClasses['p-2']} */ ;
+/** @type {__VLS_StyleScopedClasses['rounded']} */ ;
+/** @type {__VLS_StyleScopedClasses['bg-gray-50']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-gray-900']} */ ;
+/** @type {__VLS_StyleScopedClasses['font-medium']} */ ;
+/** @type {__VLS_StyleScopedClasses['p-2']} */ ;
+/** @type {__VLS_StyleScopedClasses['rounded']} */ ;
+/** @type {__VLS_StyleScopedClasses['bg-blue-100']} */ ;
+/** @type {__VLS_StyleScopedClasses['text-blue-700']} */ ;
+/** @type {__VLS_StyleScopedClasses['italic']} */ ;
+/** @type {__VLS_StyleScopedClasses['font-medium']} */ ;
 /** @type {__VLS_StyleScopedClasses['flex-1']} */ ;
 /** @type {__VLS_StyleScopedClasses['border']} */ ;
 /** @type {__VLS_StyleScopedClasses['rounded']} */ ;
@@ -1211,6 +1410,8 @@ const __VLS_self = (await import('vue')).defineComponent({
         imageContainer: imageContainer,
         connecting: connecting,
         systemPrompt: systemPrompt,
+        messages: messages,
+        currentText: currentText,
         pluginResults: pluginResults,
         isGeneratingImage: isGeneratingImage,
         generatingMessage: generatingMessage,
@@ -1222,6 +1423,8 @@ const __VLS_self = (await import('vue')).defineComponent({
         micLevel: micLevel,
         micWaveform: micWaveform,
         chatActive: chatActive,
+        isRecognizing: isRecognizing,
+        interimTranscript: interimTranscript,
         scrollCurrentResultToTop: scrollCurrentResultToTop,
         isTwitterUrl: isTwitterUrl,
         startChat: startChat,

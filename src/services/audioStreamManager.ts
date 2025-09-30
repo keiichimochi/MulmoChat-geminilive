@@ -230,6 +230,19 @@ export class AudioStreamManager {
       });
     }
 
+    // Debug: Log AudioContext state
+    console.log('🔊 AudioContext state:', this.audioContext.state);
+
+    // Resume AudioContext if suspended (browser autoplay policy)
+    if (this.audioContext.state === 'suspended') {
+      console.warn('⚠️ AudioContext is suspended, attempting to resume...');
+      this.audioContext.resume().then(() => {
+        console.log('✅ AudioContext resumed successfully');
+      }).catch((error) => {
+        console.error('❌ Failed to resume AudioContext:', error);
+      });
+    }
+
     try {
       // Convert 16-bit PCM ArrayBuffer to Float32Array
       const pcmData = new Int16Array(audioData);
@@ -454,9 +467,17 @@ export class AudioStreamManager {
   }
 
   private convertToFloat32Array(audioData: ArrayBuffer): Float32Array {
-    // Convert ArrayBuffer to Float32Array
-    // This assumes the input is already in the correct format
-    return new Float32Array(audioData);
+    // 16ビットの符号付き整数としてデータを解釈
+    const pcmData = new Int16Array(audioData);
+
+    // Web Audio APIが要求する-1.0から1.0の間の浮動小数点数に変換
+    const float32Data = new Float32Array(pcmData.length);
+    for (let i = 0; i < pcmData.length; i++) {
+      // 16ビット整数の最大値32767で割って正規化する
+      float32Data[i] = pcmData[i] / 32767.0;
+    }
+
+    return float32Data;
   }
 
   private playAudioBuffer(audioBuffer: AudioBuffer): void {

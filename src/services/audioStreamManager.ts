@@ -60,6 +60,11 @@ export class AudioStreamManager {
     bitDepth: 16,
   };
 
+  // VAD (Voice Activity Detection) configuration
+  private readonly SILENCE_THRESHOLD = 0.01; // 無音と判断する閾値（調整可能）
+  private readonly VAD_ENABLED = true; // VAD機能の有効/無効
+  private readonly VAD_DEBUG = false; // VADデバッグログの有効/無効
+
   // Event handlers
   private audioDataHandlers: Array<(audioData: Float32Array) => void> = [];
   private errorHandlers: Array<(error: Error) => void> = [];
@@ -424,13 +429,30 @@ export class AudioStreamManager {
         const inputBuffer = event.inputBuffer;
         const inputData = inputBuffer.getChannelData(0);
 
-        // Convert to the format expected by Gemini Live (16kHz, PCM)
-        const processedData = this.resampleAndConvert(inputData);
+        // VAD: Calculate audio level (RMS)
+        const level = this.calculateAudioLevel(inputData);
 
         // Update input metrics
         this.updateInputMetrics(inputData);
 
-        // Notify audio data handlers
+        // VAD: Skip sending if audio level is below threshold
+        if (this.VAD_ENABLED && level < this.SILENCE_THRESHOLD) {
+          // Silence detected - do not send to API
+          if (this.VAD_DEBUG) {
+            console.log(`🔇 VAD: Silence detected (level: ${level.toFixed(4)} < threshold: ${this.SILENCE_THRESHOLD})`);
+          }
+          return;
+        }
+
+        // VAD Debug: Log active speech detection
+        if (this.VAD_DEBUG && this.VAD_ENABLED) {
+          console.log(`🎤 VAD: Speech detected (level: ${level.toFixed(4)} >= threshold: ${this.SILENCE_THRESHOLD})`);
+        }
+
+        // Convert to the format expected by Gemini Live (16kHz, PCM)
+        const processedData = this.resampleAndConvert(inputData);
+
+        // Notify audio data handlers (send to Gemini Live API)
         this.audioDataHandlers.forEach(handler => {
           try {
             handler(processedData);
@@ -445,7 +467,11 @@ export class AudioStreamManager {
       this.gainNode.connect(processor);
       processor.connect(this.audioContext.destination);
 
-      console.log('🎤 Input processing setup complete');
+      console.log('🎤 Input processing setup complete', {
+        VAD_enabled: this.VAD_ENABLED,
+        silence_threshold: this.SILENCE_THRESHOLD,
+        VAD_debug: this.VAD_DEBUG
+      });
 
     } catch (error) {
       console.error('❌ Failed to setup input processing:', error);
@@ -478,6 +504,20 @@ export class AudioStreamManager {
     }
 
     return float32Data;
+  }
+
+  /**
+   * 音声データの音量レベル（RMS）を計算します。
+   * @param data 音声データ（Float32Array）
+   * @returns 音量レベル（0.0〜1.0）
+   */
+  private calculateAudioLevel(data: Float32Array): number {
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+      sum += data[i] * data[i];
+    }
+    const rms = Math.sqrt(sum / data.length);
+    return rms;
   }
 
   private playAudioBuffer(audioBuffer: AudioBuffer): void {

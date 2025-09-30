@@ -221,14 +221,22 @@ export class AudioStreamManager {
    * Process incoming audio data for output
    */
   processAudioOutput(audioData: ArrayBuffer): void {
-    if (!this.audioContext || !this.outputNode) {
-      console.warn('⚠️ Audio output not ready, dropping audio data');
-      return;
+    // Create AudioContext if not initialized
+    if (!this.audioContext) {
+      console.log('🔊 Initializing AudioContext for output');
+      this.audioContext = new AudioContext({
+        sampleRate: this.config.outputSampleRate,
+        latencyHint: 'interactive',
+      });
     }
 
     try {
-      // Convert ArrayBuffer to Float32Array
-      const float32Data = this.convertToFloat32Array(audioData);
+      // Convert 16-bit PCM ArrayBuffer to Float32Array
+      const pcmData = new Int16Array(audioData);
+      const float32Data = new Float32Array(pcmData.length);
+      for (let i = 0; i < pcmData.length; i++) {
+        float32Data[i] = pcmData[i] / 32768.0; // Normalize to -1.0 to 1.0
+      }
 
       // Create audio buffer
       const audioBuffer = this.audioContext.createBuffer(
@@ -237,15 +245,20 @@ export class AudioStreamManager {
         this.config.outputSampleRate
       );
 
-      // Copy data to buffer - ensure it's an ArrayBuffer
-      const channelData = new Float32Array(audioData);
-      audioBuffer.copyToChannel(channelData, 0);
+      // Copy data to buffer
+      audioBuffer.copyToChannel(float32Data, 0);
 
       // Play audio buffer
       this.playAudioBuffer(audioBuffer);
 
       // Update metrics
       this.updateOutputMetrics(float32Data);
+
+      console.log('🔊 Audio output processed and playing', {
+        samples: float32Data.length,
+        duration: audioBuffer.duration.toFixed(2) + 's',
+        sampleRate: this.config.outputSampleRate
+      });
 
     } catch (error) {
       console.error('❌ Failed to process audio output:', error);

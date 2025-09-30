@@ -650,7 +650,22 @@ async function messageHandler(message: GeminiLiveMessage): Promise<void> {
 
           if (part.inlineData?.mimeType?.startsWith('audio/') && part.inlineData?.data) {
             console.log("🔊 Received audio data");
-            await playAudioFromBase64(part.inlineData.data);
+            // Use AudioStreamManager for audio playback
+            try {
+              const binaryString = atob(part.inlineData.data);
+              const bytes = new Uint8Array(binaryString.length);
+              for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+              }
+              if (geminiLive.audioManager) {
+                geminiLive.audioManager.processAudioOutput(bytes.buffer);
+              } else {
+                console.warn("⚠️ AudioManager not initialized, falling back to playAudioFromBase64");
+                await playAudioFromBase64(part.inlineData.data);
+              }
+            } catch (error) {
+              console.error("❌ Failed to process and play audio:", error);
+            }
           }
         }
       }

@@ -280,8 +280,8 @@ export class GeminiSessionManager {
     config: GeminiSessionConfig
   ): Promise<EphemeralTokenInfo> {
     const now = Date.now();
-    const expireTime = new Date(now + 5 * 60 * 1000); // 5 minutes
-    const sessionStartExpiry = new Date(now + 60 * 1000); // must connect within 60 seconds
+    const expireTime = new Date(now + 60 * 60 * 1000); // 60 minutes (1 hour)
+    const sessionStartExpiry = new Date(now + 5 * 60 * 1000); // must connect within 5 minutes
 
     const normalizedModel = this.normalizeModelName(config.model);
     const liveConfig = this.buildLiveConnectConfig(config);

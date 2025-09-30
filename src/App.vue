@@ -1045,27 +1045,52 @@ function arrayBufferToBase64(buffer: ArrayBufferLike): string {
   return btoa(binary);
 }
 
-// Function to play audio from base64 data
+// Function to play audio from base64 data using Web Audio API
 async function playAudioFromBase64(base64Data: string): Promise<void> {
   try {
-    // Convert base64 to blob
-    const binaryString = atob(base64Data);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
+    // Gemini Live sends 24kHz 16-bit PCM mono audio
+    const SAMPLE_RATE = 24000;
+
+    // Use AudioStreamManager if available, otherwise create temporary AudioContext
+    if (geminiLive.audioManager) {
+      await geminiLive.audioManager.playPCMAudio(base64Data, SAMPLE_RATE);
+    } else {
+      // Fallback: Create temporary AudioContext
+      console.warn("⚠️ AudioManager not initialized, using fallback audio playback");
+
+      // Convert base64 to ArrayBuffer
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // Convert 16-bit PCM to Float32Array
+      const pcmData = new Int16Array(bytes.buffer);
+      const floatData = new Float32Array(pcmData.length);
+      for (let i = 0; i < pcmData.length; i++) {
+        floatData[i] = pcmData[i] / 32768.0; // Normalize to -1.0 to 1.0
+      }
+
+      const audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+      const audioBuffer = audioContext.createBuffer(1, floatData.length, SAMPLE_RATE);
+      audioBuffer.copyToChannel(floatData, 0);
+
+      const source = audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioContext.destination);
+      source.start(0);
+
+      console.log("🔊 Fallback audio playback started", {
+        sampleRate: SAMPLE_RATE,
+        duration: audioBuffer.duration.toFixed(2) + "s",
+        samples: floatData.length
+      });
+
+      source.onended = () => {
+        source.disconnect();
+      };
     }
-
-    const audioBlob = new Blob([bytes], { type: 'audio/pcm' });
-    const audioUrl = URL.createObjectURL(audioBlob);
-
-    // Create and play audio element
-    const audio = new Audio(audioUrl);
-    audio.addEventListener('ended', () => {
-      URL.revokeObjectURL(audioUrl);
-    });
-
-    await audio.play();
-    console.log("🔊 Audio playback started");
   } catch (error) {
     console.error("❌ Failed to play audio:", error);
   }

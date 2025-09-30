@@ -253,6 +253,75 @@ export class AudioStreamManager {
   }
 
   /**
+   * Play PCM audio from base64 encoded data
+   * @param base64Data Base64 encoded PCM audio data (16-bit signed integer)
+   * @param sampleRate Sample rate of the audio (default: 24000 for Gemini Live)
+   */
+  async playPCMAudio(base64Data: string, sampleRate: number = 24000): Promise<void> {
+    try {
+      // Convert base64 to ArrayBuffer
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // Convert 16-bit PCM to Float32Array
+      const pcmData = new Int16Array(bytes.buffer);
+      const floatData = new Float32Array(pcmData.length);
+      for (let i = 0; i < pcmData.length; i++) {
+        floatData[i] = pcmData[i] / 32768.0; // Normalize to -1.0 to 1.0
+      }
+
+      // Create AudioContext if not initialized
+      if (!this.audioContext) {
+        this.audioContext = new AudioContext({
+          sampleRate: sampleRate,
+          latencyHint: 'interactive'
+        });
+      }
+
+      // Resume context if suspended
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume();
+      }
+
+      // Create AudioBuffer
+      const audioBuffer = this.audioContext.createBuffer(
+        this.config.channels,
+        floatData.length,
+        sampleRate
+      );
+      audioBuffer.copyToChannel(floatData, 0);
+
+      // Create buffer source and play
+      const source = this.audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(this.audioContext.destination);
+      source.start(0);
+
+      // Update metrics
+      this.updateOutputMetrics(floatData);
+
+      console.log('🔊 PCM audio playback started', {
+        sampleRate,
+        duration: audioBuffer.duration.toFixed(2) + 's',
+        samples: floatData.length
+      });
+
+      return new Promise<void>((resolve) => {
+        source.onended = () => {
+          source.disconnect();
+          resolve();
+        };
+      });
+    } catch (error) {
+      console.error('❌ Failed to play PCM audio:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Event handler registration
    */
   onAudioData(handler: (audioData: Float32Array) => void): () => void {

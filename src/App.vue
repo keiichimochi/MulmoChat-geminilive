@@ -619,7 +619,8 @@ async function processToolCall(msg: any): Promise<void> {
 }
 
 async function messageHandler(message: GeminiLiveMessage): Promise<void> {
-  console.log("📥 Received Gemini Live message:", JSON.stringify(message, null, 2));
+  console.log('[DEBUG] 📥 受信:', JSON.stringify(message, null, 2));
+  // console.log("📥 Received Gemini Live message:", JSON.stringify(message, null, 2));
 
   try {
     // Handle Gemini Live API message structure
@@ -649,7 +650,7 @@ async function messageHandler(message: GeminiLiveMessage): Promise<void> {
           }
 
           if (part.inlineData?.mimeType?.startsWith('audio/') && part.inlineData?.data) {
-            console.log("🔊 Received audio data");
+            // console.log("🔊 Received audio data");
             // Use AudioStreamManager for audio playback
             try {
               const binaryString = atob(part.inlineData.data);
@@ -658,6 +659,7 @@ async function messageHandler(message: GeminiLiveMessage): Promise<void> {
                 bytes[i] = binaryString.charCodeAt(i);
               }
               if (geminiLive.audioManager) {
+                console.log(`[DEBUG] 🔊 再生処理へ: 音声データ ${bytes.length} bytes`);
                 geminiLive.audioManager.processAudioOutput(bytes.buffer);
               } else {
                 console.warn("⚠️ AudioManager not initialized, falling back to playAudioFromBase64");
@@ -907,8 +909,9 @@ async function startChat(): Promise<void> {
               },
             };
 
+            console.log(`[DEBUG] 📤 送信中: 音声データ ${audioData.length} bytes`);
             await geminiLive.wsClient.sendMessage(audioMessage);
-            console.log("🎵 Audio data sent to Gemini Live:", audioData.length);
+            // console.log("🎵 Audio data sent to Gemini Live:", audioData.length);
           } catch (error) {
             console.error("❌ Failed to stream audio chunk:", error);
           }

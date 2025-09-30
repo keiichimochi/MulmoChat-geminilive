@@ -1053,3 +1053,124 @@ private readonly VAD_ENABLED = false;
 **実装ステータス**: ✅ VAD機能完全実装 - 本番デプロイ可能
 
 **Current Status**: ✅ コスト削減機能実装完了 - 実機テスト推奨
+
+---
+
+## 🐛 デバッグログ機能強化 (2025年10月1日)
+
+### 目的
+
+音声応答問題の切り分けのため、データフローの各段階にデバッグログを追加。
+
+### 実装内容
+
+#### 1. ステップ1: 音声データ送信ログ ✅
+
+**修正ファイル**: [src/App.vue:910](src/App.vue#L910)
+
+```typescript
+console.log(`[DEBUG] 📤 送信中: 音声データ ${audioData.length} bytes`);
+await geminiLive.wsClient.sendMessage(audioMessage);
+```
+
+**確認事項**: マイク入力がGemini Live APIに送信されているか
+
+#### 2. ステップ2: メッセージ受信ログ ✅
+
+**修正ファイル**: [src/App.vue:622](src/App.vue#L622)
+
+```typescript
+async function messageHandler(message: GeminiLiveMessage): Promise<void> {
+  console.log('[DEBUG] 📥 受信:', JSON.stringify(message, null, 2));
+  // ...
+}
+```
+
+**確認事項**: Gemini Live APIから何らかの応答を受信しているか
+
+#### 3. ステップ3: 音声再生処理ログ ✅
+
+**修正ファイル**: [src/App.vue:662](src/App.vue#L662)
+
+```typescript
+if (geminiLive.audioManager) {
+  console.log(`[DEBUG] 🔊 再生処理へ: 音声データ ${bytes.length} bytes`);
+  geminiLive.audioManager.processAudioOutput(bytes.buffer);
+}
+```
+
+**確認事項**: 受信した音声データを再生処理に渡しているか
+
+#### 4. ステップ4: AudioContext状態ログ ✅
+
+**修正ファイル**: [src/services/audioStreamManager.ts:239](src/services/audioStreamManager.ts#L239)
+
+```typescript
+console.log(`[DEBUG] 🎧 AudioContext state: ${this.audioContext.state}, 再生開始...`);
+```
+
+**確認事項**: AudioContextの状態（running/suspended/closed）
+
+#### 5. ステップ5: PCM変換結果ログ ✅
+
+**修正ファイル**: [src/services/audioStreamManager.ts:260-264](src/services/audioStreamManager.ts#L260-L264)
+
+```typescript
+if (float32Data.length > 0) {
+  console.log(`[DEBUG] 🎼 フォーマット変換成功: データ長 ${float32Data.length}, 最初の値 ${float32Data[0]}`);
+} else {
+  console.warn('[DEBUG] ⚠️ フォーマット変換後のデータが空です');
+}
+```
+
+**確認事項**: PCMデータ変換が正常に完了しているか
+
+### デバッグフロー
+
+**期待されるログ出力順序**:
+
+1. `[DEBUG] 📤 送信中: 音声データ XXX bytes` - ステップ1成功
+2. `[DEBUG] 📥 受信: {...}` - ステップ2成功
+3. `[DEBUG] 🔊 再生処理へ: 音声データ XXX bytes` - ステップ3成功
+4. `[DEBUG] 🎧 AudioContext state: running, 再生開始...` - ステップ4成功
+5. `[DEBUG] 🎼 フォーマット変換成功: データ長 XXX, 最初の値 X.XX` - ステップ5成功
+
+### 問題切り分け
+
+**ログが表示されない場合**:
+
+- **ステップ1で停止**: マイク入力またはVADの問題
+- **ステップ2で停止**: WebSocket接続またはAPI通信の問題
+- **ステップ3で停止**: メッセージハンドリングまたはデータフォーマットの問題
+- **ステップ4で停止**: AudioContext初期化の問題
+- **ステップ5で停止**: PCM変換処理の問題
+
+**AudioContext state値の意味**:
+- `running`: 正常（音声再生可能）
+- `suspended`: 停止中（ブラウザ自動再生ポリシー）
+- `closed`: 終了済み（再利用不可）
+
+### 使用方法
+
+1. ブラウザの開発者ツールでコンソールを開く
+2. 「Start Voice Chat」をクリック
+3. 音声を入力（例: 「こんにちは」）
+4. コンソールで`[DEBUG]`ログを確認
+
+### 期待される効果
+
+- **問題箇所の特定**: データフローのどこで問題が発生しているか明確化
+- **デバッグ効率**: ログベースでの迅速な原因調査
+- **本番切り替え**: デバッグログは必要に応じてコメントアウト可能
+
+### コード変更サマリー
+
+**変更ファイル**:
+1. `src/App.vue` - 3箇所にデバッグログ追加
+2. `src/services/audioStreamManager.ts` - 2箇所にデバッグログ追加
+
+**追加ログ数**: 5種類のデバッグログ
+
+**実装ステータス**: ✅ デバッグログ完全実装 - トラブルシューティング準備完了
+
+**Current Status**: ✅ 包括的デバッグログ実装 - 問題切り分け可能

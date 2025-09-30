@@ -236,7 +236,7 @@ export class AudioStreamManager {
     }
 
     // Debug: Log AudioContext state
-    console.log('🔊 AudioContext state:', this.audioContext.state);
+    console.log(`[DEBUG] 🎧 AudioContext state: ${this.audioContext.state}, 再生開始...`);
 
     // Resume AudioContext if suspended (browser autoplay policy)
     if (this.audioContext.state === 'suspended') {
@@ -254,6 +254,13 @@ export class AudioStreamManager {
       const float32Data = new Float32Array(pcmData.length);
       for (let i = 0; i < pcmData.length; i++) {
         float32Data[i] = pcmData[i] / 32768.0; // Normalize to -1.0 to 1.0
+      }
+
+      // Debug: Log conversion result
+      if (float32Data.length > 0) {
+        console.log(`[DEBUG] 🎼 フォーマット変換成功: データ長 ${float32Data.length}, 最初の値 ${float32Data[0]}`);
+      } else {
+        console.warn('[DEBUG] ⚠️ フォーマット変換後のデータが空です');
       }
 
       // Create audio buffer
